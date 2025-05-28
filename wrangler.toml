@@ -1,0 +1,18 @@
+# wrangler.toml
+name = "github-file-api" # Worker 的名称，可以自定义
+main = "src/index.js"    # Worker 的入口文件路径
+compatibility_date = "2023-10-30" # 使用一个较新的兼容性日期
+
+# 环境变量
+[vars]
+# GITHUB_PAT 已从此移除，请在 Cloudflare Dashboard 中设置为 Secret
+GITHUB_REPO_OWNER = "bobfile666"      # 仓库所有者
+GITHUB_REPO_NAME = "bob-files"        # 仓库名称
+LOGGING_ENABLED = "true"             # 开启自定义日志
+
+# 如果你需要绑定 KV, R2, D1 等服务，可以在这里配置
+# [kv_namespaces]
+#  { binding = "MY_KV_NAMESPACE", id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+
+# [r2_buckets]
+#  { binding = "MY_BUCKET", bucket_name = "my-bucket" }
