@@ -9,9 +9,14 @@ function jsonResponse(data, status = 200, headers = {}) {
 }
 
 // 辅助函数：创建错误响应
-function errorResponse(message, status = 500) {
-    if (env.LOGGING_ENABLED === "true") {
+// 修改: 添加 env 参数
+function errorResponse(env, message, status = 500) {
+    // 检查 env 是否被正确传递，以及 LOGGING_ENABLED 是否为 "true"
+    if (env && env.LOGGING_ENABLED === "true") {
         console.error(`Error: ${message}, Status: ${status}`);
+    } else if (!env) {
+        // 如果 env 没有被传递，也记录一个控制台错误，帮助调试
+        console.error(`Error (env not provided to errorResponse): ${message}, Status: ${status}`);
     }
     return jsonResponse({ error: message }, status);
 }
@@ -79,7 +84,8 @@ async function getFileSha(env, owner, repo, branch, path) {
     }
 }
 
-// 新添加的函数
+// src/index.js
+// 修改: 在 catch 块中调用 errorResponse 时传递 env
 async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, commitMessage) {
     // 功能: 上传或更新文件到用户的 GitHub 分支
     // 参数:
@@ -102,7 +108,6 @@ async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, c
         console.log(`Attempting to upload/update: ${apiUrl} on branch ${branch}`);
     }
 
-    // 尝试获取现有文件的 SHA，以便更新而不是创建（如果文件已存在）
     const sha = await getFileSha(env, owner, repo, branch, filePath);
 
     const body = {
@@ -112,7 +117,7 @@ async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, c
     };
 
     if (sha) {
-        body.sha = sha; // 如果文件存在，提供 SHA 以更新
+        body.sha = sha;
         if (env.LOGGING_ENABLED === "true") {
             console.log(`Updating existing file ${filePath} on branch ${branch} with SHA ${sha}`);
         }
@@ -138,7 +143,8 @@ async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, c
 
         if (!response.ok) {
             console.error(`GitHub API error during upload/update for ${filePath} on branch ${branch}: ${response.status}`, responseData);
-            return errorResponse(`GitHub API error: ${response.status} - ${responseData.message || 'Failed to upload file'}`, response.status);
+            // 修改: 传递 env
+            return errorResponse(env, `GitHub API error: ${response.status} - ${responseData.message || 'Failed to upload file'}`, response.status);
         }
 
         if (env.LOGGING_ENABLED === "true") {
@@ -149,11 +155,12 @@ async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, c
             path: responseData.content.path,
             commit: responseData.commit.sha,
             url: responseData.content.html_url
-        }, sha ? 200 : 201); // 201 for created, 200 for updated
+        }, sha ? 200 : 201);
 
     } catch (error) {
         console.error(`Error in uploadFileToGitHub for ${filePath} on branch ${branch}:`, error.message, error.stack);
-        return errorResponse("Server error during file upload: " + error.message, 500);
+        // 修改: 传递 env
+        return errorResponse(env, "Server error during file upload: " + error.message, 500);
     }
 }
 
@@ -174,9 +181,9 @@ function arrayBufferToBase64(buffer) {
 }
 
 
-// 新添加的函数
+// 修改: 在 catch 块和错误处理中调用 errorResponse 时传递 env
 async function getFileFromGitHub(env, username, filePath) {
-    // 功能: 从用户的 GitHub 分支下载文件，使用 raw.githubusercontent.com 以获取原始文件内容
+    // 功能: 从用户的 GitHub 分支下载文件
     // 参数:
     //   env: Cloudflare Worker 的环境变量对象
     //   username: 用户名，将作为分支名
@@ -186,8 +193,6 @@ async function getFileFromGitHub(env, username, filePath) {
     const owner = env.GITHUB_REPO_OWNER;
     const repo = env.GITHUB_REPO_NAME;
     const branch = username;
-
-    // 使用 raw.githubusercontent.com 获取原始文件内容，这更直接且高效
     const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
 
     if (env.LOGGING_ENABLED === "true") {
@@ -197,38 +202,30 @@ async function getFileFromGitHub(env, username, filePath) {
     try {
         const response = await fetch(rawUrl, {
             headers: {
-                // 对于 raw.githubusercontent.com，通常不需要 PAT，除非仓库是私有的。
-                // 但如果分支保护规则或仓库设置需要，可以加上。
-                // 'Authorization': `token ${env.GITHUB_PAT}`, // 可能不需要
                 'User-Agent': 'Cloudflare-Worker-GitHub-API',
             },
         });
 
         if (!response.ok) {
             if (response.status === 404) {
-                 if (env.LOGGING_ENABLED === "true") {
+                if (env.LOGGING_ENABLED === "true") {
                     console.log(`File not found (404) at ${rawUrl}`);
                 }
-                return errorResponse(`File not found at path: ${filePath} for user ${username}`, 404);
+                // 修改: 传递 env
+                return errorResponse(env, `File not found at path: ${filePath} for user ${username}`, 404);
             }
-            // 对于其他错误，尝试读取 GitHub 的错误信息（如果它是JSON的话）
-            // raw.githubusercontent.com 404 时返回纯文本 "404: Not Found"
             const errorText = await response.text();
             console.error(`GitHub raw content error for ${filePath} on branch ${branch}: ${response.status}`, errorText);
-            return errorResponse(`GitHub error: ${response.status} - ${errorText || 'Failed to download file'}`, response.status);
+            // 修改: 传递 env
+            return errorResponse(env, `GitHub error: ${response.status} - ${errorText || 'Failed to download file'}`, response.status);
         }
 
         if (env.LOGGING_ENABLED === "true") {
             console.log(`File ${filePath} successfully fetched from branch ${branch}`);
         }
-        // 直接将 GitHub 的响应（包括头部和主体）流式传输回客户端
-        // 这能正确处理 Content-Type, Content-Length 等
         const newHeaders = new Headers(response.headers);
-        // 添加一个自定义头部，以便知道它是通过我们的 Worker 代理的
         newHeaders.set('X-Proxied-By', 'Cloudflare-Worker-GitHub-API');
-        // 确保浏览器可以下载
         newHeaders.set('Content-Disposition', `attachment; filename="${filePath.split('/').pop()}"`);
-
 
         return new Response(response.body, {
             status: response.status,
@@ -238,11 +235,12 @@ async function getFileFromGitHub(env, username, filePath) {
 
     } catch (error) {
         console.error(`Error in getFileFromGitHub for ${filePath} on branch ${branch}:`, error.message, error.stack);
-        return errorResponse("Server error during file download: " + error.message, 500);
+        // 修改: 传递 env
+        return errorResponse(env, "Server error during file download: " + error.message, 500);
     }
 }
 
-// 新添加的函数
+// 修改: 在 catch 块和错误处理中调用 errorResponse 时传递 env
 async function deleteFileFromGitHub(env, username, filePath, commitMessage) {
     // 功能: 从用户的 GitHub 分支删除文件
     // 参数:
@@ -260,13 +258,13 @@ async function deleteFileFromGitHub(env, username, filePath, commitMessage) {
         console.log(`Attempting to delete: ${filePath} from branch ${branch}`);
     }
 
-    // 删除文件需要知道文件的 SHA
     const sha = await getFileSha(env, owner, repo, branch, filePath);
     if (!sha) {
         if (env.LOGGING_ENABLED === "true") {
             console.log(`File not found: ${filePath} on branch ${branch}, cannot delete.`);
         }
-        return errorResponse(`File not found at path: ${filePath} for user ${username}, cannot delete.`, 404);
+        // 修改: 传递 env
+        return errorResponse(env, `File not found at path: ${filePath} for user ${username}, cannot delete.`, 404);
     }
 
     const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
@@ -289,32 +287,33 @@ async function deleteFileFromGitHub(env, username, filePath, commitMessage) {
         });
 
         if (!response.ok) {
-            // 404 理论上已经被 getFileSha 捕获，但以防万一
             if (response.status === 404) {
-                return errorResponse(`File not found (or already deleted) at path: ${filePath} for user ${username}`, 404);
+                 // 修改: 传递 env
+                return errorResponse(env, `File not found (or already deleted) at path: ${filePath} for user ${username}`, 404);
             }
             const errorData = await response.json();
             console.error(`GitHub API error during deletion of ${filePath} on branch ${branch}: ${response.status}`, errorData);
-            return errorResponse(`GitHub API error: ${response.status} - ${errorData.message || 'Failed to delete file'}`, response.status);
+            // 修改: 传递 env
+            return errorResponse(env, `GitHub API error: ${response.status} - ${errorData.message || 'Failed to delete file'}`, response.status);
         }
         
-        // 删除成功，GitHub API 通常返回 200 OK 和 commit 信息
         const responseData = await response.json(); 
         if (env.LOGGING_ENABLED === "true") {
             console.log(`File ${filePath} successfully deleted from branch ${branch}. Commit: ${responseData.commit.sha}`);
         }
         return jsonResponse({
             message: `File ${filePath} successfully deleted from branch ${branch}.`,
-            commit: responseData.commit.sha // GitHub 返回的 commit 信息
-        }, 200); // 200 OK for successful deletion
+            commit: responseData.commit.sha
+        }, 200);
 
     } catch (error) {
         console.error(`Error in deleteFileFromGitHub for ${filePath} on branch ${branch}:`, error.message, error.stack);
-        return errorResponse("Server error during file deletion: " + error.message, 500);
+        // 修改: 传递 env
+        return errorResponse(env, "Server error during file deletion: " + error.message, 500);
     }
 }
 
-// 新添加的函数
+// 修改: 在 catch 块和错误处理中调用 errorResponse 时传递 env
 async function listFilesFromGitHub(env, username, directoryPath = '') {
     // 功能: 列出用户 GitHub 分支中指定目录的文件和文件夹
     // 参数:
@@ -342,36 +341,36 @@ async function listFilesFromGitHub(env, username, directoryPath = '') {
         });
 
         if (response.status === 404) {
-            // 这可能意味着分支不存在，或者路径不存在
-            // 如果分支不存在，GitHub 通常会返回类似 "No commit found for the ref <branch_name>" 的消息
             const errorDataCheck = await response.clone().json().catch(() => null);
             if (errorDataCheck && errorDataCheck.message && errorDataCheck.message.includes("No commit found for the ref")) {
                 if (env.LOGGING_ENABLED === "true") {
                     console.log(`Branch ${branch} not found or empty.`);
                 }
-                return jsonResponse({ message: `User (branch) '${username}' not found or has no content. Please upload a file first to create the branch.`, files: [] }, 200); // 返回空列表，因为分支可能只是空的
+                // 注意：这里返回的是 jsonResponse，不需要改动 errorResponse
+                return jsonResponse({ message: `User (branch) '${username}' not found or has no content. Please upload a file first to create the branch.`, files: [] }, 200);
             }
             if (env.LOGGING_ENABLED === "true") {
                 console.log(`Directory not found (404): ${directoryPath} on branch ${branch}`);
             }
-            return errorResponse(`Directory not found at path: /${directoryPath} for user ${username}`, 404);
+            // 修改: 传递 env
+            return errorResponse(env, `Directory not found at path: /${directoryPath} for user ${username}`, 404);
         }
 
         if (!response.ok) {
             const errorData = await response.json();
             console.error(`GitHub API error while listing files in ${directoryPath} on branch ${branch}: ${response.status}`, errorData);
-            return errorResponse(`GitHub API error: ${response.status} - ${errorData.message || 'Failed to list files'}`, response.status);
+            // 修改: 传递 env
+            return errorResponse(env, `GitHub API error: ${response.status} - ${errorData.message || 'Failed to list files'}`, response.status);
         }
 
         const data = await response.json();
-        // 过滤并格式化输出
         const files = data.map(item => ({
             name: item.name,
             path: item.path,
-            type: item.type, // "file" or "dir"
-            size: item.size, // only for files
+            type: item.type,
+            size: item.size,
             url: item.html_url,
-            download_url: item.download_url // for files
+            download_url: item.download_url
         }));
 
         if (env.LOGGING_ENABLED === "true") {
@@ -381,26 +380,24 @@ async function listFilesFromGitHub(env, username, directoryPath = '') {
 
     } catch (error) {
         console.error(`Error in listFilesFromGitHub for ${directoryPath} on branch ${branch}:`, error.message, error.stack);
-        return errorResponse("Server error during file listing: " + error.message, 500);
+        // 修改: 传递 env
+        return errorResponse(env, "Server error during file listing: " + error.message, 500);
     }
 }
 
 
+// 修改: 所有对 errorResponse 的调用都传递 env
 export default {
     async fetch(request, env, ctx) {
-        // env: 包含环境变量 (包括 secrets)
-        // ctx: 包含如 waitUntil 等方法
-        
         if (env.LOGGING_ENABLED === "true") {
             console.log(`Request received: ${request.method} ${request.url}`);
-            // 记录所有环境变量除了 GITHUB_PAT
             const safeEnv = {...env};
-            delete safeEnv.GITHUB_PAT;
+            delete safeEnv.GITHUB_PAT; // 确保 PAT 不被记录到日志中
             console.log("Current ENV:", JSON.stringify(safeEnv));
         }
 
         const url = new URL(request.url);
-        const pathSegments = url.pathname.split('/').filter(Boolean); // [username, ...filePathParts]
+        const pathSegments = url.pathname.split('/').filter(Boolean);
 
         if (pathSegments.length === 0 && request.method === 'GET') {
             return jsonResponse({
@@ -410,49 +407,52 @@ export default {
         }
         
         if (pathSegments.length < 1) {
-            return errorResponse("Invalid path. Expected format: /[username]/[filepath] or /[username]/ for listing root.", 400);
+            // 修改: 传递 env
+            return errorResponse(env, "Invalid path. Expected format: /[username]/[filepath] or /[username]/ for listing root.", 400);
         }
 
         const username = pathSegments[0];
-        const filePath = pathSegments.slice(1).join('/'); // 如果 pathSegments 只有一个元素 (username), filePath 会是空字符串
+        const filePath = pathSegments.slice(1).join('/');
 
-        // 检查必要的环境变量
         if (!env.GITHUB_PAT || !env.GITHUB_REPO_OWNER || !env.GITHUB_REPO_NAME) {
             console.error("Missing critical GitHub configuration in environment variables.");
-            return errorResponse("Server configuration error: Missing GitHub credentials or repository info.", 500);
+            // 修改: 传递 env
+            return errorResponse(env, "Server configuration error: Missing GitHub credentials or repository info.", 500);
         }
         
-        // 路由逻辑
         switch (request.method) {
-            case 'PUT': // 上传或更新文件
-            case 'POST': // 也可以用 POST 上传，这里统一用 PUT 语义更清晰
+            case 'PUT':
+            case 'POST':
                 if (!filePath) {
-                    return errorResponse("File path is required for uploads.", 400);
+                    // 修改: 传递 env
+                    return errorResponse(env, "File path is required for uploads.", 400);
                 }
                 const contentArrayBuffer = await request.arrayBuffer();
                 if (contentArrayBuffer.byteLength === 0) {
-                    return errorResponse("Cannot upload an empty file.", 400);
+                    // 修改: 传递 env
+                    return errorResponse(env, "Cannot upload an empty file.", 400);
                 }
-                // 从请求头获取提交信息，或使用默认值
                 const commitMessageUpload = request.headers.get('X-Commit-Message') || `Upload file: ${filePath} by ${username}`;
                 return await uploadFileToGitHub(env, username, filePath, contentArrayBuffer, commitMessageUpload);
 
-            case 'GET': // 下载文件或列出目录
-                if (filePath) { // 如果有 filePath，则下载文件
+            case 'GET':
+                if (filePath) {
                     return await getFileFromGitHub(env, username, filePath);
-                } else { // 没有 filePath，则列出用户根目录
+                } else {
                     return await listFilesFromGitHub(env, username, '');
                 }
 
-            case 'DELETE': // 删除文件
+            case 'DELETE':
                 if (!filePath) {
-                    return errorResponse("File path is required for deletion.", 400);
+                    // 修改: 传递 env
+                    return errorResponse(env, "File path is required for deletion.", 400);
                 }
                 const commitMessageDelete = request.headers.get('X-Commit-Message') || `Delete file: ${filePath} by ${username}`;
                 return await deleteFileFromGitHub(env, username, filePath, commitMessageDelete);
 
             default:
-                return errorResponse(`Method ${request.method} not allowed.`, 405);
+                // 修改: 传递 env
+                return errorResponse(env, `Method ${request.method} not allowed.`, 405);
         }
     },
 };
