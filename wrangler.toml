@@ -1,21 +1,34 @@
 # wrangler.toml
-name = "github-file-api" # Worker 的名称，可以自定义
-main = "src/index.js"    # Worker 的入口文件路径
-compatibility_date = "2023-10-30" # 使用一个较新的兼容性日期
+name = "github-file-api"
+main = "src/index.js"
+compatibility_date = "2024-03-15" # 请使用一个较新的日期
 
-# 环境变量
+# -- Variables (non-secret, accessible via env.VAR_NAME) --
 [vars]
-# GITHUB_PAT 已从此移除，请在 Cloudflare Dashboard 中设置为 Secret
-GITHUB_REPO_OWNER = "bobfile666"      # 仓库所有者
-GITHUB_REPO_NAME = "bob-files"        # 仓库名称
-LOGGING_ENABLED = "true"             # 开启自定义日志
+GITHUB_REPO_OWNER = "bobfile666"  # 替换为你的
+GITHUB_REPO_NAME = "github-file-api"      # 替换为你的
+TARGET_BRANCH = "main"
+LOGGING_ENABLED = "true"
+# API_VERSION = "v1" # 可选
 
-# 如果你需要绑定 KV, R2, D1 等服务，可以在这里配置
-# [kv_namespaces]
-#  { binding = "MY_KV_NAMESPACE", id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+# -- KV Namespaces --
+[[kv_namespaces]]
+binding = "USER_UPLOAD_TIMESTAMPS_KV" # 这是你在代码中访问 KV 的方式：env.USER_UPLOAD_TIMESTAMPS_KV
+id = "28e4a81a53434f688795f3d3b4812f9b" # 粘贴你从 Dashboard 获取的 KV Namespace ID
+# preview_id = "YOUR_KV_NAMESPACE_PREVIEW_ID_HERE" # (可选) 如果你有单独的预览 Namespace ID
 
-# [r2_buckets]
-#  { binding = "MY_BUCKET", bucket_name = "my-bucket" }
+# -- D1 Databases --
+[[d1_databases]]
+binding = "DB" # 这是你在代码中访问 D1 的方式：env.DB
+database_name = "github-file-api-db" # 你在 Dashboard 中创建的 D1 数据库名
+database_id = "07be31d3-dda3-4473-9f79-f749ad54b8cf" # 粘贴你从 Dashboard 获取的 D1 Database ID
+# preview_database_id = "YOUR_D1_PREVIEW_DATABASE_ID_HERE" # (可选)
+
+# -- Secrets (set these in Cloudflare Dashboard) --
+# 不要将实际的 secret 值写在这里。这些只是占位符，提醒你需要设置它们。
+# GITHUB_PAT
+# DYNAMIC_TOKEN_SECRET
+# MASTER_ENCRYPTION_KEY
 
 # wrangler.toml (wrangler v3.88.0^)
 [observability.logs]

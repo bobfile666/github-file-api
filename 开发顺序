@@ -1,0 +1,74 @@
+your-github-file-api-worker/
+├── src/
+│   ├── index.js                   # Worker 入口点，处理路由和请求分发
+│   ├── handlers/                  # 存放不同类型请求的处理函数
+│   │   ├── auth.js                # 处理认证相关逻辑 (如动态令牌请求)
+│   │   ├── files.js               # 处理文件上传、下载、删除、列表的核心逻辑
+│   │   └── admin.js               # (可选) 如果有管理员操作的API端点
+│   ├── services/                  # 存放与外部服务交互的逻辑
+│   │   ├── github.js              # 封装所有与 GitHub API 的交互
+│   │   ├── d1Database.js          # 封装所有与 D1 数据库的交互 (用户、日志)
+│   │   └── kvStore.js             # 封装所有与 KV Store 的交互 (速率限制)
+│   ├── utils/                     # 存放通用辅助函数
+│   │   ├── crypto.js              # 加密、解密、哈希、签名等相关函数
+│   │   ├── response.js            # 标准化JSON响应和错误响应的辅助函数
+│   │   └── validators.js          # (可选) 输入验证函数
+│   ├── constants.js               # (可选) 存放常量，如错误代码、固定字符串等
+│   └── types.js                   # (可选) 如果使用TypeScript或JSDoc定义类型
+│
+├── wrangler.toml                  # Worker 配置文件 (环境变量, bindings等)
+├── package.json                   # 项目依赖管理 (如果需要安装如itty-router等)
+├── package-lock.json              # 锁定依赖版本
+└── README.md                      # 项目说明文档
+
+1.  **基础响应和路由 (`src/index.js`, `src/utils/response.js`)**
+    *   目标: 实现基本的请求入口、简单的路由逻辑（即使只是占位符）、以及标准化的JSON成功和错误响应函数。
+    *   调试: 确保Worker能启动，能根据不同路径返回预期的（占位）响应或错误。
+
+2.  **GitHub 服务封装 (`src/services/github.js`)**
+    *   目标: 编写与GitHub API交互的函数 (获取文件SHA、获取文件内容、创建/更新文件、删除文件)。先不考虑加密。
+    *   调试: 单元测试这些函数（可以使用模拟的`fetch`或直接用Postman/curl通过一个简单的Worker端点调用它们），确保能正确操作GitHub仓库中的文件。确保 `GITHUB_PAT` (作为Secret) 能被正确读取和使用。
+
+3.  **核心文件操作逻辑 - 无加密、无认证 (`src/handlers/files.js` - 简化版)**
+    *   目标: 实现文件上传、下载、删除、列表的基本流程，**暂时不加入加密和动态令牌认证**。直接使用 `github.js` 中的函数。`index.json` 的读写是这里的核心。
+    *   调试:
+        *   上传一个文件，检查 `index.json` 是否正确创建/更新，哈希文件是否上传到GitHub。
+        *   下载该文件，看是否能取回。
+        *   列出文件，看列表是否正确。
+        *   删除文件，检查 `index.json` 和物理哈希文件是否按预期移除。
+        *   重点关注 `index.json` 的并发安全（虽然初版可能不完美，但要注意其SHA的使用）。
+
+4.  **加密/解密工具 (`src/utils/crypto.js`)**
+    *   目标: 实现对称加密/解密函数 (AES-GCM)、SHA256哈希计算、Base64转换。MEK相关的加密/解密用户密钥的函数。
+    *   调试: 编写单元测试来验证这些加密解密函数是否能正确工作（加密后能解密回原文，哈希值稳定等）。
+
+5.  **集成文件加密 (`src/handlers/files.js` 中加入加密逻辑)**
+    *   目标: 在文件上传时加密内容，下载时解密内容。
+    *   调试:
+        *   上传文件，检查GitHub上存储的是否是加密后的内容（和IV）。
+        *   下载文件，确保能正确解密并得到原始文件。
+        *   需要模拟D1中存储的用户密钥（或者先硬编码一个测试密钥，MEK也硬编码测试，但**生产前必须用Secrets**）。
+
+6.  **D1 数据库服务 (`src/services/d1Database.js`)**
+    *   目标: 编写从D1获取用户加密密钥（已用MEK加密的）、记录上传日志的函数。
+    *   调试: 通过Worker端点测试能否正确读写D1。确保MEK（来自Secret）能正确用于解密用户密钥。
+
+7.  **动态令牌认证 (`src/handlers/auth.js`, `src/utils/crypto.js` 签名部分, `src/index.js` 集成)**
+    *   目标: 实现动态令牌的请求和验证逻辑。
+    *   调试:
+        *   测试请求动态令牌端点，看是否能返回签名后的令牌。
+        *   用获取到的令牌去访问受保护的文件操作端点，测试令牌验证（签名、有效期、用户名匹配）。
+        *   测试无效令牌、过期令牌的情况。
+        *   确保 `DYNAMIC_TOKEN_SECRET` (来自Secret) 被正确使用。
+
+8.  **KV 速率限制 (`src/services/kvStore.js`, `src/handlers/files.js` 集成)**
+    *   目标: 实现基于KV的上传速率限制。
+    *   调试: 连续快速上传文件，测试是否会触发429错误，以及等待后是否能成功上传。
+
+9.  **日志记录 (`src/services/d1Database.js`, `src/handlers/files.js` 集成)**
+    *   目标: 在文件上传成功或失败后，将日志写入D1。
+    *   调试: 执行上传操作，然后查询D1的 `UploadLogs` 表，确认日志是否按预期记录。
+
+10. **全面测试和边缘情况处理**
+    *   测试各种错误路径、无效输入、并发场景（尽可能模拟）。
+    *   完善错误处理和日志记录。
