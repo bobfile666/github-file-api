@@ -16,3 +16,10 @@ LOGGING_ENABLED = "true"             # 开启自定义日志
 
 # [r2_buckets]
 #  { binding = "MY_BUCKET", bucket_name = "my-bucket" }
+
+# wrangler.toml (wrangler v3.88.0^)
+[observability.logs]
+enabled = true
+
+
+

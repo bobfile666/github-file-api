@@ -85,7 +85,7 @@ async function getFileSha(env, owner, repo, branch, path) {
 }
 
 // src/index.js
-// 修改: 在 catch 块中调用 errorResponse 时传递 env
+// 修改: 在上传前确保分支存在，如果不存在则尝试创建
 async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, commitMessage) {
     // 功能: 上传或更新文件到用户的 GitHub 分支
     // 参数:
@@ -98,32 +98,89 @@ async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, c
 
     const owner = env.GITHUB_REPO_OWNER;
     const repo = env.GITHUB_REPO_NAME;
-    const branch = username; // 用户名即分支名
+    const branchToEnsure = username; // 用户名即分支名
 
-    // 将 ArrayBuffer 转换为 Base64 字符串
-    const base64Content = arrayBufferToBase64(contentArrayBuffer);
-
-    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
-    if (env.LOGGING_ENABLED === "true") {
-        console.log(`Attempting to upload/update: ${apiUrl} on branch ${branch}`);
+    // 步骤 1: 检查分支是否存在 (通过尝试获取分支信息间接判断)
+    // 或者更直接地，先尝试创建，如果创建失败因为已存在，那也没关系
+    // 我们需要一个基础 SHA 来创建分支，通常是主分支的最新提交
+    const mainSha = await getMainBranchSha(env, owner, repo);
+    if (!mainSha) {
+        return errorResponse(env, "Could not determine base SHA to create branch.", 500);
     }
 
-    const sha = await getFileSha(env, owner, repo, branch, filePath);
+    // 尝试创建分支。如果分支已存在，createBranch 也会返回 true (或处理 422 错误)
+    // 注意: GitHub 的 contents API (PUT) 在指定 branch 时，如果 branch 不存在会失败。
+    // 所以我们需要先确保分支存在。
+
+    // 检查分支是否已存在（通过getFileSha在目标分支上尝试获取一个不存在的特殊文件）
+    // 如果 getFileSha 返回特定错误表明分支不存在，则创建分支
+    // 这是一个间接的方式。更直接的方式是尝试获取分支信息。
+    const branchExistsCheckUrl = `https://api.github.com/repos/${owner}/${repo}/branches/${branchToEnsure}`;
+    let branchExists = false;
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`Checking if branch ${branchToEnsure} exists: ${branchExistsCheckUrl}`);
+    }
+    try {
+        const branchCheckResponse = await fetch(branchExistsCheckUrl, {
+             headers: {
+                'Authorization': `token ${env.GITHUB_PAT}`,
+                'User-Agent': 'Cloudflare-Worker-GitHub-API',
+                'Accept': 'application/vnd.github.v3+json',
+            }
+        });
+        if (branchCheckResponse.ok) {
+            branchExists = true;
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`Branch ${branchToEnsure} already exists.`);
+            }
+        } else if (branchCheckResponse.status === 404) {
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`Branch ${branchToEnsure} does not exist. Attempting to create it.`);
+            }
+        } else {
+             // 其他错误，记录并假设分支不存在以尝试创建，或者也可以选择失败
+            const errorData = await branchCheckResponse.json().catch(()=>null);
+            console.warn(`Error checking branch ${branchToEnsure} existence: ${branchCheckResponse.status}`, errorData);
+        }
+    } catch (e) {
+        console.warn(`Exception while checking branch ${branchToEnsure} existence:`, e.message);
+    }
+
+
+    if (!branchExists) {
+        const branchCreated = await createBranch(env, owner, repo, branchToEnsure, mainSha);
+        if (!branchCreated) {
+            return errorResponse(env, `Failed to create branch '${branchToEnsure}'. Cannot upload file.`, 500);
+        }
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`Branch ${branchToEnsure} created or already existed. Proceeding with file upload.`);
+        }
+    }
+
+
+    // ---- 后续逻辑与之前类似 ----
+    const base64Content = arrayBufferToBase64(contentArrayBuffer);
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`;
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`Attempting to upload/update: ${apiUrl} on branch ${branchToEnsure}`);
+    }
+
+    const sha = await getFileSha(env, owner, repo, branchToEnsure, filePath);
 
     const body = {
         message: commitMessage,
         content: base64Content,
-        branch: branch,
+        branch: branchToEnsure, // 明确使用要操作的分支
     };
 
     if (sha) {
         body.sha = sha;
         if (env.LOGGING_ENABLED === "true") {
-            console.log(`Updating existing file ${filePath} on branch ${branch} with SHA ${sha}`);
+            console.log(`Updating existing file ${filePath} on branch ${branchToEnsure} with SHA ${sha}`);
         }
     } else {
         if (env.LOGGING_ENABLED === "true") {
-            console.log(`Creating new file ${filePath} on branch ${branch}`);
+            console.log(`Creating new file ${filePath} on branch ${branchToEnsure}`);
         }
     }
 
@@ -142,24 +199,24 @@ async function uploadFileToGitHub(env, username, filePath, contentArrayBuffer, c
         const responseData = await response.json();
 
         if (!response.ok) {
-            console.error(`GitHub API error during upload/update for ${filePath} on branch ${branch}: ${response.status}`, responseData);
-            // 修改: 传递 env
+            // 这里的错误可能是 "Branch not found" 如果之前的分支创建/检查逻辑有遗漏
+            // 或者文件内容问题，或者并发修改等
+            console.error(`GitHub API error during upload/update for ${filePath} on branch ${branchToEnsure}: ${response.status}`, responseData);
             return errorResponse(env, `GitHub API error: ${response.status} - ${responseData.message || 'Failed to upload file'}`, response.status);
         }
 
         if (env.LOGGING_ENABLED === "true") {
-            console.log(`File ${filePath} successfully ${sha ? 'updated' : 'created'} on branch ${branch}. Commit: ${responseData.commit.sha}`);
+            console.log(`File ${filePath} successfully ${sha ? 'updated' : 'created'} on branch ${branchToEnsure}. Commit: ${responseData.commit.sha}`);
         }
         return jsonResponse({
-            message: `File ${filePath} successfully ${sha ? 'updated' : 'created'} on branch ${branch}.`,
+            message: `File ${filePath} successfully ${sha ? 'updated' : 'created'} on branch ${branchToEnsure}.`,
             path: responseData.content.path,
             commit: responseData.commit.sha,
             url: responseData.content.html_url
         }, sha ? 200 : 201);
 
     } catch (error) {
-        console.error(`Error in uploadFileToGitHub for ${filePath} on branch ${branch}:`, error.message, error.stack);
-        // 修改: 传递 env
+        console.error(`Error in uploadFileToGitHub for ${filePath} on branch ${branchToEnsure}:`, error.message, error.stack);
         return errorResponse(env, "Server error during file upload: " + error.message, 500);
     }
 }
@@ -384,6 +441,137 @@ async function listFilesFromGitHub(env, username, directoryPath = '') {
         return errorResponse(env, "Server error during file listing: " + error.message, 500);
     }
 }
+
+// 新添加的函数
+async function getMainBranchSha(env, owner, repo) {
+    // 功能: 获取仓库默认分支（通常是 main 或 master）的最新 commit SHA
+    // 参数:
+    //   env: Cloudflare Worker 的环境变量对象
+    //   owner: 仓库所有者
+    //   repo: 仓库名称
+    // 返回: 默认分支的最新 commit SHA，如果失败则返回 null
+
+    // 首先获取仓库信息，以确定默认分支名
+    const repoInfoUrl = `https://api.github.com/repos/${owner}/${repo}`;
+    let defaultBranchName = 'main'; // 默认猜测是 main
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`Fetching repository info to determine default branch: ${repoInfoUrl}`);
+    }
+    try {
+        const repoResponse = await fetch(repoInfoUrl, {
+            headers: {
+                'Authorization': `token ${env.GITHUB_PAT}`,
+                'User-Agent': 'Cloudflare-Worker-GitHub-API',
+                'Accept': 'application/vnd.github.v3+json',
+            },
+        });
+        if (repoResponse.ok) {
+            const repoData = await repoResponse.json();
+            defaultBranchName = repoData.default_branch;
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`Default branch for ${owner}/${repo} is ${defaultBranchName}`);
+            }
+        } else {
+            // 如果获取仓库信息失败，记录错误但继续使用 'main' 作为猜测
+            const errorData = await repoResponse.text();
+            console.error(`Failed to fetch repo info for ${owner}/${repo}: ${repoResponse.status}`, errorData);
+        }
+    } catch (error) {
+        console.error(`Error fetching repo info for ${owner}/${repo}:`, error.message, error.stack);
+    }
+
+    // 获取默认分支的最新 commit
+    const branchInfoUrl = `https://api.github.com/repos/${owner}/${repo}/branches/${defaultBranchName}`;
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`Fetching SHA for default branch (${defaultBranchName}): ${branchInfoUrl}`);
+    }
+    try {
+        const response = await fetch(branchInfoUrl, {
+            headers: {
+                'Authorization': `token ${env.GITHUB_PAT}`,
+                'User-Agent': 'Cloudflare-Worker-GitHub-API',
+                'Accept': 'application/vnd.github.v3+json',
+            },
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            console.error(`GitHub API error while fetching default branch SHA for ${defaultBranchName}: ${response.status}`, errorData);
+            return null;
+        }
+        const data = await response.json();
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`SHA for default branch ${defaultBranchName} is ${data.commit.sha}`);
+        }
+        return data.commit.sha;
+    } catch (error) {
+        console.error(`Error in getMainBranchSha for ${defaultBranchName}:`, error.message, error.stack);
+        return null;
+    }
+}
+
+// 新添加的函数
+async function createBranch(env, owner, repo, newBranchName, baseSha) {
+    // 功能: 在 GitHub 仓库中创建一个新分支
+    // 参数:
+    //   env: Cloudflare Worker 的环境变量对象
+    //   owner: 仓库所有者
+    //   repo: 仓库名称
+    //   newBranchName: 新分支的名称
+    //   baseSha: 新分支将基于此 commit SHA 创建
+    // 返回: true 如果成功创建，false 如果失败
+
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/git/refs`;
+    const body = {
+        ref: `refs/heads/${newBranchName}`,
+        sha: baseSha,
+    };
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`Attempting to create branch: ${newBranchName} from SHA: ${baseSha} at ${apiUrl}`);
+    }
+
+    try {
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `token ${env.GITHUB_PAT}`,
+                'User-Agent': 'Cloudflare-Worker-GitHub-API',
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (response.status === 201) { // 201 Created
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`Branch ${newBranchName} created successfully.`);
+            }
+            return true;
+        } else if (response.status === 422) { // Unprocessable Entity - often means ref already exists
+            const errorData = await response.json();
+            if (errorData.message && errorData.message.toLowerCase().includes("reference already exists")) {
+                if (env.LOGGING_ENABLED === "true") {
+                    console.log(`Branch ${newBranchName} already exists.`);
+                }
+                return true; // 认为分支已存在也是一种成功
+            }
+            console.error(`GitHub API error (422) while creating branch ${newBranchName}:`, errorData);
+            return false;
+        } else {
+            const errorData = await response.json();
+            console.error(`GitHub API error while creating branch ${newBranchName}: ${response.status}`, errorData);
+            return false;
+        }
+    } catch (error) {
+        console.error(`Error in createBranch for ${newBranchName}:`, error.message, error.stack);
+        return false;
+    }
+}
+
+
+
 
 
 // 修改: 所有对 errorResponse 的调用都传递 env
