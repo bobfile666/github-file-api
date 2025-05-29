@@ -162,14 +162,17 @@ export async function exportCryptoKeyToRaw(cryptoKey) {
  * @returns {Promise<CryptoKey>}
  */
 export async function importRawToAesGcmCryptoKey(rawKeyBuffer, usages = ['encrypt', 'decrypt']) {
-    if (rawKeyBuffer.byteLength !== AES_GCM_KEY_LENGTH_BITS / 8) {
-        throw new Error(`Invalid key length for AES-GCM ${AES_GCM_KEY_LENGTH_BITS}-bit. Expected ${AES_GCM_KEY_LENGTH_BITS / 8} bytes.`);
+    // 功能：将原始密钥字节数组导入为可用于 AES-GCM 操作的 CryptoKey 对象。
+    // 参数：rawKeyBuffer (ArrayBuffer), usages (Array<string>)
+    // 返回：Promise<CryptoKey>
+    if (!rawKeyBuffer || rawKeyBuffer.byteLength !== AES_GCM_KEY_LENGTH_BITS / 8) { // AES_GCM_KEY_LENGTH_BITS 应定义为 256
+        throw new Error(`Invalid key length for AES-GCM ${AES_GCM_KEY_LENGTH_BITS}-bit. Expected ${AES_GCM_KEY_LENGTH_BITS / 8} bytes, got ${rawKeyBuffer ? rawKeyBuffer.byteLength : 'null'}.`);
     }
     return crypto.subtle.importKey(
         'raw', 
         rawKeyBuffer, 
-        { name: AES_GCM_ALGORITHM_NAME, length: AES_GCM_KEY_LENGTH_BITS }, // 明确指定算法和长度
-        true, // typically true if you might re-export or for certain operations
+        { name: AES_GCM_ALGORITHM_NAME, length: AES_GCM_KEY_LENGTH_BITS }, 
+        true, 
         usages
     );
 }
