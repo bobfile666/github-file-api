@@ -2,9 +2,13 @@
 // 描述：处理管理员相关的 API 请求，例如创建用户。
 
 import { jsonResponse, errorResponse } from '../utils/response.js';
-import { generateAesGcmKey, exportCryptoKeyToRaw } from '../utils/crypto.js';
-import { storeEncryptedUserKey, getUserSymmetricKey } from '../services/d1Database.js'; // getUserSymmetricKey 用于检查用户是否已存在
-import { ensureFileExists } from '../services/github.js'; // 新增导入
+import { 
+    generateAesGcmKey, 
+    exportCryptoKeyToRaw, 
+    arrayBufferToBase64 // <--- 确保此导入存在
+} from '../utils/crypto.js'; 
+import { storeEncryptedUserKey } from '../services/d1Database.js';
+import { ensureFileExists } from '../services/github.js';
 
 
 /**
