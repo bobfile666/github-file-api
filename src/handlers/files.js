@@ -1,9 +1,225 @@
-// src/handlers/files.js (续)
-export async function handleFileDownload(request, env, ctx, authenticatedUsername, originalFilePath) {
-    // 功能：处理文件下载，包括认证、从索引查找、解密和日志记录。
-    // 参数：request, env, ctx, authenticatedUsername, originalFilePath
-    // 返回：Promise<Response>
+// src/handlers/files.js
+// 描述：处理所有与文件操作相关的核心逻辑，包括认证后的操作、加密、索引、速率限制和日志。
+
+import * as githubService from '../services/github.js';
+import { jsonResponse, errorResponse } from '../utils/response.js';
+import { 
+    AES_GCM_IV_LENGTH_BYTES,
+    calculateSha256, 
+    arrayBufferToBase64, 
+    base64ToArrayBuffer,
+    encryptDataAesGcm,
+    decryptDataAesGcm,
+} from '../utils/crypto.js'; 
+import { getUserSymmetricKey, logFileActivity } from '../services/d1Database.js';
+import * as kvService from '../services/kvStore.js';
+
+// --- 内部辅助函数：索引管理 ---
+// getUserIndex 和 updateUserIndex 是内部辅助函数，不需要从 files.js 导出给 index.js
+// 它们被下面的导出函数所调用。
+async function getUserIndex(env, username, targetBranch) {
+    // 功能：获取指定用户的 index.json 内容。
+    // (代码和之前一样)
+    const owner = env.GITHUB_REPO_OWNER;
+    const repo = env.GITHUB_REPO_NAME;
+    const indexPath = `${username}/index.json`;
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[getUserIndex] User: ${username} - Fetching index: ${indexPath}`);
+    }
+
+    const indexFile = await githubService.getFileContentAndSha(env, owner, repo, indexPath, targetBranch);
+
+    if (indexFile && indexFile.content_base64) {
+        try {
+            const decodedContent = new TextDecoder().decode(base64ToArrayBuffer(indexFile.content_base64));
+            const indexData = JSON.parse(decodedContent);
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`[getUserIndex] User: ${username} - Index found with SHA: ${indexFile.sha}. Files count: ${Object.keys(indexData.files || {}).length}`);
+            }
+            return { indexData: indexData.files ? indexData : { files: {} }, sha: indexFile.sha };
+        } catch (e) {
+            if (env.LOGGING_ENABLED === "true") {
+                console.error(`[getUserIndex] User: ${username} - Error parsing index.json:`, e.message, "Content causing error:", indexFile.content_base64.substring(0,100));
+            }
+            return { indexData: { files: {} }, sha: indexFile.sha }; 
+        }
+    }
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[getUserIndex] User: ${username} - Index file not found or content empty. Returning new index structure.`);
+    }
+    return { indexData: { files: {} }, sha: null };
+}
+
+async function updateUserIndex(env, username, indexData, currentSha, targetBranch, commitMessage) {
+    // 功能：更新或创建用户的 index.json 文件。
+    // (代码和之前一样)
+    const owner = env.GITHUB_REPO_OWNER;
+    const repo = env.GITHUB_REPO_NAME;
+    const indexPath = `${username}/index.json`;
     
+    const dataToWrite = { files: indexData.files || {} };
+    const contentBase64 = arrayBufferToBase64(new TextEncoder().encode(JSON.stringify(dataToWrite, null, 2)));
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[updateUserIndex] User: ${username} - Attempting to ${currentSha ? 'update' : 'create'} index. SHA: ${currentSha || 'N/A'}. Commit: "${commitMessage}"`);
+    }
+
+    const result = await githubService.createFileOrUpdateFile(env, owner, repo, indexPath, targetBranch, contentBase64, commitMessage, currentSha);
+    
+    const success = result && !result.error && (result.status === 200 || result.status === 201);
+    if (env.LOGGING_ENABLED === "true") {
+        if (success) {
+            console.log(`[updateUserIndex] User: ${username} - Index ${currentSha ? 'updated' : 'created'} successfully.`);
+        } else {
+            console.error(`[updateUserIndex] User: ${username} - Failed to update index. GitHub API response:`, result);
+        }
+    }
+    return success;
+}
+
+
+// --- 导出的请求处理函数 ---
+
+export async function handleFileUpload(request, env, ctx, authenticatedUsername, originalFilePath) {
+    // 功能：处理文件上传，包括速率限制、加密、GitHub 存储、索引更新、KV 时间戳更新和日志记录。
+    // (代码和之前一样)
+    if (!authenticatedUsername || !originalFilePath) {
+        return errorResponse(env, "Authenticated username and original file path are required for upload.", 400);
+    }
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[handleFileUpload] User: ${authenticatedUsername} - Initiating upload for: ${originalFilePath}`);
+    }
+
+    const UPLOAD_INTERVAL_SECONDS = parseInt(env.UPLOAD_INTERVAL_SECONDS || "10", 10);
+    const currentTimeMs = Date.now();
+    const lastUploadTimeMs = await kvService.getLastUploadTimestamp(env, authenticatedUsername);
+
+    if (lastUploadTimeMs && (currentTimeMs - lastUploadTimeMs) < (UPLOAD_INTERVAL_SECONDS * 1000)) {
+        const waitSeconds = Math.ceil(((UPLOAD_INTERVAL_SECONDS * 1000) - (currentTimeMs - lastUploadTimeMs)) / 1000);
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[handleFileUpload] User: ${authenticatedUsername} - Rate limited. Wait: ${waitSeconds}s`);
+        }
+        return errorResponse(env, `Too many upload requests. Please wait ${waitSeconds} seconds.`, 429);
+    }
+
+    const owner = env.GITHUB_REPO_OWNER;
+    const repo = env.GITHUB_REPO_NAME;
+    const targetBranch = env.TARGET_BRANCH || "main";
+    
+    let logEntry = { 
+        user_id: authenticatedUsername,
+        action_type: 'upload',
+        original_file_path: originalFilePath,
+        file_hash: null, 
+        file_size_bytes: 0, 
+        status: 'failure', 
+        error_message: null,
+        source_ip: request.headers.get('cf-connecting-ip'),
+        user_agent: request.headers.get('user-agent')
+    };
+
+    try {
+        const plainContentArrayBuffer = await request.arrayBuffer();
+        logEntry.file_size_bytes = plainContentArrayBuffer.byteLength;
+
+        if (plainContentArrayBuffer.byteLength === 0) {
+            logEntry.error_message = "Cannot upload an empty file.";
+            if (env.LOGGING_ENABLED === "true") console.warn(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message}`);
+            ctx.waitUntil(logFileActivity(env, logEntry));
+            return errorResponse(env, logEntry.error_message, 400);
+        }
+
+        const userFileEncryptionKey = await getUserSymmetricKey(env, authenticatedUsername);
+        if (!userFileEncryptionKey) {
+            logEntry.error_message = `Encryption key not found for user.`;
+            if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message}`);
+            ctx.waitUntil(logFileActivity(env, logEntry));
+            return errorResponse(env, `Could not retrieve encryption key for user '${authenticatedUsername}'. User may not exist or setup is incomplete.`, 403);
+        }
+        
+        let encryptedData;
+        try {
+            encryptedData = await encryptDataAesGcm(plainContentArrayBuffer, userFileEncryptionKey);
+        } catch (e) {
+            if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - Encryption failed for ${originalFilePath}:`, e.message, e.stack);
+            logEntry.error_message = "File encryption failed.";
+            ctx.waitUntil(logFileActivity(env, logEntry));
+            return errorResponse(env, logEntry.error_message, 500);
+        }
+        const ivAndCiphertextBuffer = new Uint8Array(encryptedData.iv.byteLength + encryptedData.ciphertext.byteLength);
+        ivAndCiphertextBuffer.set(encryptedData.iv, 0);
+        ivAndCiphertextBuffer.set(new Uint8Array(encryptedData.ciphertext), encryptedData.iv.byteLength);
+        const contentToUploadBase64 = arrayBufferToBase64(ivAndCiphertextBuffer.buffer);
+        
+        const fileHash = await calculateSha256(plainContentArrayBuffer);
+        logEntry.file_hash = fileHash;
+        const hashedFilePath = `${authenticatedUsername}/${fileHash}`; 
+
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[handleFileUpload] User: ${authenticatedUsername} - Encrypted. Original='${originalFilePath}', Hash='${fileHash}', TargetPath='${hashedFilePath}'`);
+        }
+
+        const { indexData, sha: indexSha } = await getUserIndex(env, authenticatedUsername, targetBranch);
+
+        const fileCommitMessage = `Chore: Upload encrypted content ${fileHash} for user ${authenticatedUsername} (file: ${originalFilePath})`;
+        const existingHashedFile = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
+        
+        if (!existingHashedFile) { 
+            const uploadResult = await githubService.createFileOrUpdateFile(env, owner, repo, hashedFilePath, targetBranch, contentToUploadBase64, fileCommitMessage, null);
+            if (uploadResult.error) {
+                logEntry.error_message = `GitHub: Failed to upload encrypted file ${hashedFilePath}: ${uploadResult.message}`;
+                if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message}`);
+                ctx.waitUntil(logFileActivity(env, logEntry));
+                return errorResponse(env, logEntry.error_message, uploadResult.status || 500);
+            }
+            if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - Encrypted file ${hashedFilePath} created on GitHub.`);
+        } else {
+            if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - Encrypted file for hash ${fileHash} already exists on GitHub. Skipping physical upload.`);
+        }
+        
+        if (!indexData.files) indexData.files = {};
+        indexData.files[originalFilePath] = fileHash; 
+        const indexCommitMessage = `Feat: Update index for ${authenticatedUsername}, maps '${originalFilePath}' to '${fileHash}'`;
+        const indexUpdated = await updateUserIndex(env, authenticatedUsername, indexData, indexSha, targetBranch, indexCommitMessage);
+
+        if (!indexUpdated) {
+            logEntry.error_message = "GitHub: Failed to update user index after file upload.";
+            if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message} Physical file ${hashedFilePath} might be orphaned.`);
+            ctx.waitUntil(logFileActivity(env, logEntry));
+            return errorResponse(env, "Encrypted file content possibly uploaded, but failed to update user index.", 500);
+        }
+
+        const kvTimestampTtl = parseInt(env.KV_TIMESTAMP_TTL_SECONDS || (UPLOAD_INTERVAL_SECONDS * 60 * 24).toString(), 10);
+        ctx.waitUntil(kvService.updateLastUploadTimestamp(env, authenticatedUsername, currentTimeMs, kvTimestampTtl ));
+        
+        logEntry.status = 'success';
+        ctx.waitUntil(logFileActivity(env, logEntry));
+
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[handleFileUpload] User: ${authenticatedUsername} - Successfully processed upload for ${originalFilePath}`);
+        }
+        return jsonResponse({
+            message: `File '${originalFilePath}' (as '${fileHash}') encrypted and processed successfully for user '${authenticatedUsername}'.`,
+            username: authenticatedUsername,
+            originalPath: originalFilePath,
+            filePathInRepo: hashedFilePath,
+            fileHash: fileHash,
+            indexPath: `${authenticatedUsername}/index.json`
+        }, 201);
+
+    } catch (error) {
+        if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - Unexpected error for ${originalFilePath}:`, error.message, error.stack);
+        logEntry.error_message = `Server error: ${error.message.substring(0, 255)}`;
+        ctx.waitUntil(logFileActivity(env, logEntry));
+        return errorResponse(env, "An unexpected server error occurred during file upload.", 500);
+    }
+}
+
+export async function handleFileDownload(request, env, ctx, authenticatedUsername, originalFilePath) {
+    // 功能: 处理文件下载，包括认证、从索引查找、解密和日志记录。
+    // (代码和之前一样)
     if (!authenticatedUsername || !originalFilePath) {
         return errorResponse(env, "Authenticated username and original file path are required for download.", 400);
     }
@@ -88,17 +304,17 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
         }
         
         logEntry.status = 'success';
-        logEntry.file_size_bytes = plainContentArrayBuffer.byteLength; // 解密后的文件大小
+        logEntry.file_size_bytes = plainContentArrayBuffer.byteLength;
         ctx.waitUntil(logFileActivity(env, logEntry));
         
-        const downloadFilename = originalFilePath.split('/').pop() || fileHash; // 取原始路径的最后一部分作为文件名
+        const downloadFilename = originalFilePath.split('/').pop() || fileHash;
         if (env.LOGGING_ENABLED === "true") {
             console.log(`[handleFileDownload] User: ${authenticatedUsername} - Successfully decrypted and serving ${originalFilePath}`);
         }
         return new Response(plainContentArrayBuffer, {
             headers: {
-                'Content-Type': 'application/octet-stream', // 客户端应根据MIME类型自行处理
-                'Content-Disposition': `attachment; filename="${encodeURIComponent(downloadFilename)}"`, // 确保文件名编码正确
+                'Content-Type': 'application/octet-stream',
+                'Content-Disposition': `attachment; filename="${encodeURIComponent(downloadFilename)}"`,
             }
         });
 
@@ -110,16 +326,13 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
     }
 }
 
-// src/handlers/files.js (续)
 export async function handleFileDelete(request, env, ctx, authenticatedUsername, originalFilePath) {
     // 功能: 处理文件删除，包括认证、索引更新、物理文件删除（如果无引用）和日志记录。
-    // 参数: request, env, ctx, authenticatedUsername, originalFilePath
-    // 返回: Promise<Response>
-
+    // (代码和之前一样)
     if (!authenticatedUsername || !originalFilePath) {
         return errorResponse(env, "Authenticated username and original file path are required for delete.", 400);
     }
-     if (originalFilePath.endsWith('/')) { // 防止删除目录的意图传递到这里
+     if (originalFilePath.endsWith('/')) {
         return errorResponse(env, "Cannot delete a directory-like path. Specify a file.", 400);
     }
 
@@ -164,26 +377,22 @@ export async function handleFileDelete(request, env, ctx, authenticatedUsername,
             return errorResponse(env, `File '${originalFilePath}' not found in index for user '${authenticatedUsername}'.`, 404);
         }
 
-        // 从索引中移除条目 (在 indexData 对象上操作)
         delete indexData.files[originalFilePath];
         if (env.LOGGING_ENABLED === "true") {
             console.log(`[handleFileDelete] User: ${authenticatedUsername} - Removed '${originalFilePath}' (hash: ${fileHashToDelete}) from local index data.`);
         }
         
-        // 更新 GitHub 上的索引文件
         const indexCommitMessage = `Feat: Update index for ${authenticatedUsername}, remove '${originalFilePath}'`;
         const indexUpdated = await updateUserIndex(env, authenticatedUsername, indexData, indexSha, targetBranch, indexCommitMessage);
         if (!indexUpdated) {
             logEntry.error_message = "Failed to update user index on GitHub after removing entry.";
             if (env.LOGGING_ENABLED === "true") console.error(`[handleFileDelete] User: ${authenticatedUsername} - ${logEntry.error_message}`);
             ctx.waitUntil(logFileActivity(env, logEntry));
-            // 索引更新失败，不继续删除物理文件，因为状态不一致
             return errorResponse(env, `Failed to update user index for '${originalFilePath}'. Physical file not deleted to maintain consistency.`, 500);
         }
 
-        // 检查该哈希是否仍被其他原始文件名引用 (在更新后的 indexData 中检查)
         let isHashStillReferenced = false;
-        if (indexData.files) { // 确保 indexData.files 存在
+        if (indexData.files) {
             for (const key in indexData.files) {
                 if (indexData.files[key] === fileHashToDelete) {
                     isHashStillReferenced = true;
@@ -191,7 +400,6 @@ export async function handleFileDelete(request, env, ctx, authenticatedUsername,
                 }
             }
         }
-
 
         let physicalFileDeleteOutcomeMessage = "";
         if (!isHashStillReferenced) {
@@ -205,8 +413,6 @@ export async function handleFileDelete(request, env, ctx, authenticatedUsername,
                 if (deleteResult.error) {
                     physicalFileDeleteOutcomeMessage = ` (Warning: Failed to delete physical file ${fileHashToDelete}: ${deleteResult.message})`;
                     if (env.LOGGING_ENABLED === "true") console.warn(`[handleFileDelete] User: ${authenticatedUsername} - ${physicalFileDeleteOutcomeMessage}`);
-                    // 即使物理文件删除失败，索引已经更新，可能需要管理员介入清理孤儿文件
-                    // 但对于用户而言，文件已从索引中移除
                 } else {
                     physicalFileDeleteOutcomeMessage = ` (Physical file ${fileHashToDelete} also deleted)`;
                     if (env.LOGGING_ENABLED === "true") console.log(`[handleFileDelete] User: ${authenticatedUsername} - ${physicalFileDeleteOutcomeMessage}`);
@@ -238,12 +444,9 @@ export async function handleFileDelete(request, env, ctx, authenticatedUsername,
     }
 }
 
-// src/handlers/files.js (续)
 export async function handleFileList(request, env, ctx, authenticatedUsername, originalDirectoryPath = '') {
-    // 功能：处理文件列表请求，包括认证和日志记录（可选）。
-    // 参数：request, env, ctx, authenticatedUsername, originalDirectoryPath
-    // 返回：Promise<Response>
-
+    // 功能: 处理文件列表请求，包括认证和日志记录（可选）。
+    // (代码和之前一样)
     if (!authenticatedUsername) {
         return errorResponse(env, "Authenticated username is required for listing files.", 400);
     }
@@ -272,12 +475,11 @@ export async function handleFileList(request, env, ctx, authenticatedUsername, o
         const indexFileExists = await githubService.getFileShaFromPath(env, owner, repo, indexPath, targetBranch);
 
         if (!indexFileExists) {
-            // 如果索引文件根本不存在，对于根目录列表，返回空是合理的。
             if ((originalDirectoryPath === '' || originalDirectoryPath === '/')) {
                 logEntry.status = 'success'; 
-                // (可选) 即使是空列表也记录成功日志
-                // ctx.waitUntil(logFileActivity(env, logEntry)); 
                 if (env.LOGGING_ENABLED === "true") console.log(`[handleFileList] User: ${authenticatedUsername} - Index file does not exist. Returning empty list for root.`);
+                // 对于列表操作，成功返回空列表通常不强制记录详细日志，除非审计需要
+                // ctx.waitUntil(logFileActivity(env, logEntry)); 
                 return jsonResponse({ path: '/', files: [] }, 200);
             }
             logEntry.error_message = "User index file not found.";
@@ -286,20 +488,17 @@ export async function handleFileList(request, env, ctx, authenticatedUsername, o
             return errorResponse(env, `User '${authenticatedUsername}' or their index file not found.`, 404);
         }
         
-        // 确保 indexData.files 存在，即使它是空的
         const userFiles = (indexData && indexData.files) ? indexData.files : {};
 
         if (Object.keys(userFiles).length === 0) {
-            // 索引文件存在但为空
             const currentPathNormalized = (originalDirectoryPath === '' || originalDirectoryPath === '/') ? '/' : (originalDirectoryPath.endsWith('/') ? originalDirectoryPath : originalDirectoryPath + '/');
             logEntry.status = 'success';
-            // ctx.waitUntil(logFileActivity(env, logEntry));
             if (env.LOGGING_ENABLED === "true") console.log(`[handleFileList] User: ${authenticatedUsername} - Index is empty. Returning empty list for path ${currentPathNormalized}`);
+            // ctx.waitUntil(logFileActivity(env, logEntry));
             return jsonResponse({ path: currentPathNormalized, files: [] }, 200);
         }
 
         const requestedPathPrefix = originalDirectoryPath === '/' ? '' : (originalDirectoryPath.endsWith('/') ? originalDirectoryPath : originalDirectoryPath + '/');
-        // 如果请求根目录 ("" 或 "/"), prefix 应为空字符串以匹配所有一级条目
         const finalPrefix = (originalDirectoryPath === '' || originalDirectoryPath === '/') ? '' : requestedPathPrefix;
 
         const filesInDirectory = [];
@@ -312,10 +511,9 @@ export async function handleFileList(request, env, ctx, authenticatedUsername, o
                 if (parts.length === 1 && parts[0] !== '') { 
                     filesInDirectory.push({
                         name: parts[0],
-                        path: originalPath, // 完整的原始路径
+                        path: originalPath,
                         type: "file",
                         hash: userFiles[originalPath]
-                        // 未来可以考虑从 GitHub 获取文件大小和修改时间，但这会增加 API 调用
                     });
                 } else if (parts.length > 1 && parts[0] !== '') { 
                     directoriesInDirectory.add(parts[0]);
@@ -325,7 +523,7 @@ export async function handleFileList(request, env, ctx, authenticatedUsername, o
         
         const directoryEntries = Array.from(directoriesInDirectory).map(dirName => ({
             name: dirName,
-            path: finalPrefix + dirName, // 目录的路径
+            path: finalPrefix + dirName,
             type: "dir"
         }));
 
@@ -337,11 +535,10 @@ export async function handleFileList(request, env, ctx, authenticatedUsername, o
         });
 
         logEntry.status = 'success';
-        // (可选) 列表操作成功通常不强制记录日志，除非有特定审计需求
-        // ctx.waitUntil(logFileActivity(env, logEntry)); 
         if (env.LOGGING_ENABLED === "true") {
             console.log(`[handleFileList] User: ${authenticatedUsername} - Listed ${allEntries.length} items for path '${finalPrefix || "/"}'`);
         }
+        // ctx.waitUntil(logFileActivity(env, logEntry));
         return jsonResponse({ path: finalPrefix || '/', files: allEntries }, 200);
 
     } catch (error) {
