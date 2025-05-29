@@ -10,6 +10,52 @@ import {
     handleFileList 
 } from './handlers/files.js'; // 引入新的处理函数
 
+import { handleRequestDynamicToken } from './handlers/auth.js'; // 引入 auth handler
+import { verifyAndDecodeDynamicToken } from './utils/crypto.js'; // 引入 crypto 工具
+
+// 新增：认证中间件/函数
+/**
+ * 验证请求中的动态令牌。
+ * @param {Request} request
+ * @param {object} env
+ * @param {string} expectedUsername - 从 URL 路径中解析出的用户名，用于与令牌中的用户名比对。
+ * @returns {Promise<{valid: boolean, username?: string, payload?: object, message?: string, status?: number}>}
+ */
+async function authenticateRequestWithDynamicToken(request, env, expectedUsername) {
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return { valid: false, message: "Authorization header missing or not Bearer type.", status: 401 };
+    }
+
+    const token = authHeader.substring(7); // "Bearer ".length
+    if (!token) {
+        return { valid: false, message: "Token missing in Authorization header.", status: 401 };
+    }
+
+    if (!env.DYNAMIC_TOKEN_SECRET) {
+        console.error("DYNAMIC_TOKEN_SECRET is not configured for token verification.");
+        return { valid: false, message: "Authentication service misconfigured.", status: 500 };
+    }
+
+    const verificationResult = await verifyAndDecodeDynamicToken(token, env.DYNAMIC_TOKEN_SECRET);
+
+    if (!verificationResult.valid) {
+        return { valid: false, message: verificationResult.error || "Invalid token.", status: 401 };
+    }
+
+    // 验证令牌中的用户名是否与请求路径中的用户名匹配
+    if (verificationResult.payload.username !== expectedUsername) {
+        console.warn(`Token username mismatch: Token for '${verificationResult.payload.username}', Path for '${expectedUsername}'`);
+        return { valid: false, message: "Token not valid for this user.", status: 403 };
+    }
+
+    return { 
+        valid: true, 
+        username: verificationResult.payload.username, // 确认的用户名
+        payload: verificationResult.payload 
+    };
+}
+
 export default {
     async fetch(request, env, ctx) {
         // 全局日志，确保 env 对象存在且 LOGGING_ENABLED 被正确设置
@@ -32,42 +78,44 @@ export default {
 
         const url = new URL(request.url);
         const pathname = url.pathname;
-        const apiVersionPrefix = `/${env.API_VERSION || 'v1'}`; // e.g. /v1
+        const apiVersionPrefix = `/${env.API_VERSION || 'v1'}`;
 
         try {
-            if (pathname.startsWith(`${apiVersionPrefix}/files/`)) {
-                // 路径格式：/v1/files/{username}/{originalFilePath...}
-                // 或 /v1/files/{username}/ (用于列出用户根目录)
-                const pathSegments = pathname.substring(`${apiVersionPrefix}/files/`.length).split('/');
-                const username = pathSegments.shift(); // 第一个段是 username
+            // 认证端点 (不需要令牌认证自身)
+            if (pathname === `${apiVersionPrefix}/auth/request-token`) {
+                return await handleRequestDynamicToken(request, env, ctx);
+            }
 
-                if (!username) {
+            // 受保护的文件操作端点
+            if (pathname.startsWith(`${apiVersionPrefix}/files/`)) {
+                const pathSegments = pathname.substring(`${apiVersionPrefix}/files/`.length).split('/');
+                const usernameFromPath = pathSegments.shift(); 
+
+                if (!usernameFromPath) {
                     return errorResponse(env, "Username is missing in the path.", 400);
                 }
                 
-                // originalFilePath 可以包含子目录，或为空
+                // ---- 执行认证 ----
+                const authResult = await authenticateRequestWithDynamicToken(request, env, usernameFromPath);
+                if (!authResult.valid) {
+                   return errorResponse(env, authResult.message, authResult.status);
+                }
+                const authenticatedUsername = authResult.username; // 使用令牌中验证过的用户名
+                // -----------------
+                
                 const originalFilePath = pathSegments.join('/');
 
-                // TODO: 在这里集成动态令牌认证逻辑
-                // const authResult = await authenticateRequestWithDynamicToken(request, env, username);
-                // if (!authResult.valid) {
-                //    return errorResponse(env, authResult.message, authResult.status);
-                // }
-                // For now, we proceed without authentication for this simplified version.
-                const authenticatedUsername = username; // 假设认证成功且用户就是路径中的 username
-
-
-                if (request.method === 'PUT' || request.method === 'POST') { // 上传
+                if (request.method === 'PUT' || request.method === 'POST') {
                     if (!originalFilePath) return errorResponse(env, "File path is required for upload.", 400);
                     return await handleFileUpload(request, env, ctx, authenticatedUsername, originalFilePath);
-                } else if (request.method === 'GET') { // 下载或列表
-                    if (pathname.endsWith('/') || !originalFilePath) { // 列出目录 (e.g., /v1/files/user/docs/ or /v1/files/user/)
+                } else if (request.method === 'GET') {
+                    if (pathname.endsWith('/') || !originalFilePath) {
                         const dirPath = originalFilePath.endsWith('/') ? originalFilePath.slice(0,-1) : originalFilePath;
                         return await handleFileList(request, env, ctx, authenticatedUsername, dirPath);
-                    } else { // 下载文件
+                    } else {
                         return await handleFileDownload(request, env, ctx, authenticatedUsername, originalFilePath);
                     }
-                } else if (request.method === 'DELETE') { // 删除
+                } else if (request.method === 'DELETE') {
                      if (!originalFilePath || originalFilePath.endsWith('/')) {
                         return errorResponse(env, "Specific file path (not a directory) is required for deletion.", 400);
                     }

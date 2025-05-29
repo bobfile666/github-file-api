@@ -1,6 +1,144 @@
 // src/utils/crypto.js
 // 描述：包含所有加密、解密、哈希、签名相关的函数。
 
+// --- 动态令牌签名与验证 (HMAC-SHA256) ---
+const TOKEN_ALGORITHM = { name: 'HMAC', hash: 'SHA-256' };
+const DEFAULT_TOKEN_TTL_SECONDS = 30; // 动态令牌默认有效期
+
+/**
+ * 为动态令牌生成签名。
+ * payload -> JSON.stringify -> UTF8 Encode -> Base64URL Encode (payloadB64Url)
+ * signatureInput = payloadB64Url (或者更标准的 headerB64Url + "." + payloadB64Url)
+ * signature = HMAC(secret, signatureInput) -> Base64URL Encode (signatureB64Url)
+ * token = payloadB64Url + "." + signatureB64Url
+ * @param {object} payload - 要签名的令牌负载 (e.g., { username, exp, iat }).
+ * @param {string} secretString - 用于签名的密钥字符串 (来自 env.DYNAMIC_TOKEN_SECRET).
+ * @returns {Promise<string|null>} "payloadB64Url.signatureB64Url" 格式的令牌，或 null 如果失败.
+ */
+export async function signDynamicToken(payload, secretString) {
+    if (!payload || !secretString) {
+        console.error("signDynamicToken: Payload or secret missing.");
+        return null;
+    }
+    try {
+        const key = await crypto.subtle.importKey(
+            'raw',
+            new TextEncoder().encode(secretString),
+            TOKEN_ALGORITHM,
+            false,
+            ['sign']
+        );
+        
+        // 准备 payload，确保有 iat 和 exp
+        const issuedAt = payload.iat || Math.floor(Date.now() / 1000);
+        const expiresAt = payload.exp || (issuedAt + (payload.ttl_seconds || DEFAULT_TOKEN_TTL_SECONDS));
+        const finalPayload = { ...payload, iat: issuedAt, exp: expiresAt };
+        delete finalPayload.ttl_seconds; // 移除临时的 ttl
+
+        const payloadString = JSON.stringify(finalPayload);
+        const payloadB64Url = arrayBufferToBase64Url(new TextEncoder().encode(payloadString));
+
+        // 签名部分：通常 JWT 会签名 headerB64Url + "." + payloadB64Url
+        // 为简化，我们这里可以只签名 payloadB64Url，或者签名原始的 payloadString 都可以
+        // 重要的是验证时使用相同的数据源。
+        // 我们选择签名原始的 payloadString，然后将原始 payloadString 进行 Base64URL 编码作为令牌的第一部分。
+        const dataToSign = new TextEncoder().encode(payloadString); 
+        const signatureBuffer = await crypto.subtle.sign(TOKEN_ALGORITHM.name, key, dataToSign);
+        const signatureB64Url = arrayBufferToBase64Url(signatureBuffer);
+
+        return `${payloadB64Url}.${signatureB64Url}`;
+    } catch (e) {
+        console.error("Error signing token:", e.message, e.stack);
+        return null;
+    }
+}
+
+/**
+ * 验证动态令牌的签名和内容。
+ * 期望 tokenString 是 "payloadB64Url.signatureB64Url" 格式.
+ * @param {string} tokenString - "payloadB64Url.signatureB64Url".
+ * @param {string} secretString - 用于验证的密钥字符串.
+ * @returns {Promise<{valid: boolean, payload?: object, error?: string}>} 验证结果.
+ */
+export async function verifyAndDecodeDynamicToken(tokenString, secretString) {
+    if (!tokenString || !secretString) return { valid: false, error: "Token or secret missing" };
+    
+    const parts = tokenString.split('.');
+    if (parts.length !== 2) return { valid: false, error: "Invalid token format (expected payload.signature)" };
+
+    const [payloadB64Url, signatureB64Url] = parts;
+
+    try {
+        const key = await crypto.subtle.importKey(
+            'raw',
+            new TextEncoder().encode(secretString),
+            TOKEN_ALGORITHM,
+            false,
+            ['verify']
+        );
+        
+        const payloadString = base64UrlDecodeToString(payloadB64Url); // 解码得到原始 JSON 字符串
+        if (!payloadString) return { valid: false, error: "Invalid payload encoding" };
+
+        const payloadObject = JSON.parse(payloadString);
+        
+        // 用于验证签名的原始数据 (与签名时使用的数据一致)
+        const dataThatWasSigned = new TextEncoder().encode(payloadString); 
+        const signatureBuffer = base64UrlToArrayBuffer(signatureB64Url);
+        
+        const isValidSignature = await crypto.subtle.verify(TOKEN_ALGORITHM.name, key, signatureBuffer, dataThatWasSigned);
+
+        if (!isValidSignature) return { valid: false, error: "Invalid signature" };
+
+        // 检查有效期 (exp) 和签发时间 (iat)
+        const currentTime = Math.floor(Date.now() / 1000);
+        if (payloadObject.exp && payloadObject.exp < currentTime) {
+            return { valid: false, error: "Token expired", payload: payloadObject };
+        }
+        // 允许iat最多比当前时间晚一点点，以处理极小的时钟不同步
+        if (payloadObject.iat && payloadObject.iat > currentTime + 5) { 
+            return { valid: false, error: "Token not yet valid (iat in future)", payload: payloadObject };
+        }
+
+        return { valid: true, payload: payloadObject };
+
+    } catch (e) {
+        console.error("Error verifying token:", e.message, e.stack);
+        // JSON.parse 可能会失败
+        return { valid: false, error: `Token verification/parsing error: ${e.message}` };
+    }
+}
+
+// Base64 URL safe encoding/decoding (确保这些辅助函数存在且正确)
+function arrayBufferToBase64Url(buffer) {
+    return btoa(String.fromCharCode.apply(null, new Uint8Array(buffer)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+function base64UrlToArrayBuffer(base64url) {
+    base64url = base64url.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64url.length % 4) {
+        base64url += '=';
+    }
+    return base64ToArrayBuffer(base64url); // 调用你已有的 base64ToArrayBuffer
+}
+
+// 这个函数用于将 Base64URL 安全字符串解码为原始字符串
+function base64UrlDecodeToString(base64url) {
+    try {
+        const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+        // atob -> decode URI component for UTF-8
+        return decodeURIComponent(atob(base64).split('').map(function(c) {
+            return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+        }).join(''));
+    } catch(e) {
+        console.error("base64UrlDecodeToString failed:", e.message);
+        return null;
+    }
+}
+
 // --- 哈希 ---
 /**
  * 计算 ArrayBuffer 内容的 SHA-256 哈希值。
@@ -16,8 +154,6 @@ export async function calculateSha256(arrayBuffer) {
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// --- 动态令牌签名与验证 (HMAC-SHA256) ---
-const TOKEN_ALGORITHM = { name: 'HMAC', hash: 'SHA-256' };
 
 /**
  * 为动态令牌生成签名。

@@ -127,50 +127,67 @@ export async function storeEncryptedUserKey(env, username, rawUserKeyBuffer) {
 }
 
 
-// --- 上传日志 ---
 /**
- * 记录文件上传活动。
+ * 记录文件上传活动 (或其他文件操作，如果表结构通用)。
  * @param {object} env - Worker 环境变量.
  * @param {object} logData - 日志数据对象.
  * @property {string} user_id
  * @property {string} original_file_path
- * @property {string} file_hash
- * @property {number} file_size_bytes
+ * @property {string} [file_hash] - 对于上传是必须的
+ * @property {number} [file_size_bytes] - 对于上传
  * @property {string} status - 'success' or 'failure'
+ * @property {string} [action_type='upload'] - 可以扩展为 'download', 'delete', 'list'
  * @property {string} [error_message]
  * @property {string} [source_ip]
  * @property {string} [user_agent]
  * @returns {Promise<void>}
  */
 export async function logUploadActivity(env, logData) {
+    // 功能：向 D1 数据库记录文件操作日志。
+    // 参数：env, logData (包含日志详情的对象)
+    // 返回：无 (Promise<void>)
     if (!env.DB) {
-        if (env.LOGGING_ENABLED === "true") console.warn("D1_NOT_CONFIGURED: Upload log not saved.", logData);
+        if (env.LOGGING_ENABLED === "true") console.warn("D1_NOT_CONFIGURED: Activity log not saved.", logData);
         return;
     }
     try {
         const {
             user_id,
             original_file_path,
-            file_hash,
-            file_size_bytes,
+            file_hash = null, // 设为可选，因为删除或列表操作可能没有
+            file_size_bytes = null, // 设为可选
             status,
+            action_type = 'upload', // 默认是上传，可以扩展
             error_message = null,
             source_ip = null,
             user_agent = null
         } = logData;
-        const uploaded_at = new Date().toISOString(); // 日志记录时间
+        const logged_at = new Date().toISOString(); // 使用 logged_at 更通用
 
+        // 根据 action_type 可能需要调整 SQL 或表结构，但 UploadLogs 表目前主要针对上传
+        // 如果要记录所有操作，可以考虑一个更通用的 'FileActivityLogs' 表
         const stmt = env.DB.prepare(
             "INSERT INTO UploadLogs (user_id, original_file_path, file_hash, file_size_bytes, uploaded_at, status, error_message, source_ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        );
+        ); // uploaded_at 列名可能需要改为 logged_at 如果表更通用
+        
         await stmt.bind(
-            user_id, original_file_path, file_hash, file_size_bytes, uploaded_at, status, error_message, source_ip, user_agent
+            user_id, 
+            original_file_path, 
+            file_hash, 
+            file_size_bytes, 
+            logged_at, // 使用新的 logged_at
+            status, 
+            error_message, 
+            source_ip, 
+            user_agent
         ).run();
         
-        if (env.LOGGING_ENABLED === "true") console.log("Upload activity logged successfully for user:", user_id);
+        if (env.LOGGING_ENABLED === "true") console.log(`Activity logged: User='${user_id}', Action='${action_type}', Path='${original_file_path}', Status='${status}'`);
 
     } catch (e) {
-        console.error("Failed to log upload activity:", e.message, e.stack, "Log data:", logData);
-        // 这里可以考虑将失败的日志推送到一个备用系统或告警
+        if (env.LOGGING_ENABLED === "true") {
+            console.error("Failed to log activity:", e.message, e.stack, "Log data attempted:", logData);
+        }
+        // 告警或备用日志系统可以在这里考虑
     }
 }
