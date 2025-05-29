@@ -264,6 +264,8 @@ export async function decryptUserKeyWithMEK(encryptedUserKeyBuffer, ivForUserKey
  * @returns {string}
  */
 export function arrayBufferToBase64(buffer) {
+    // 功能：将 ArrayBuffer 转换为 Base64 编码的字符串。
+    // (代码和之前一样)
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;

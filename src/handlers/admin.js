@@ -4,6 +4,8 @@
 import { jsonResponse, errorResponse } from '../utils/response.js';
 import { generateAesGcmKey, exportCryptoKeyToRaw } from '../utils/crypto.js';
 import { storeEncryptedUserKey, getUserSymmetricKey } from '../services/d1Database.js'; // getUserSymmetricKey 用于检查用户是否已存在
+import { ensureFileExists } from '../services/github.js'; // 新增导入
+
 
 /**
  * 验证请求是否来自合法的管理员。
@@ -54,75 +56,85 @@ export async function handleAdminCreateUser(request, env, ctx) {
     }
 
     let requestBody;
-    try {
-        requestBody = await request.json();
-    } catch (e) {
-        if (env.LOGGING_ENABLED === "true") console.warn(`[handleAdminCreateUser] Invalid JSON body:`, e.message);
-        return errorResponse(env, "Invalid JSON request body.", 400);
-    }
-
+    try { requestBody = await request.json(); } catch (e) { return errorResponse(env, "Invalid JSON request body.", 400); }
     const { username } = requestBody;
-
     if (!username || typeof username !== 'string' || username.trim() === '' || username.includes('/') || username.includes('..')) {
-        // 对用户名进行一些基本验证，防止路径操纵或无效字符
-        if (env.LOGGING_ENABLED === "true") console.warn(`[handleAdminCreateUser] Invalid username provided: '${username}'`);
-        return errorResponse(env, "Invalid username provided. Username must be a non-empty string and should not contain path-like characters ('/', '..').", 400);
+        return errorResponse(env, "Invalid username provided.", 400);
     }
-    
-    // 检查 D1 数据库是否配置
-    if (!env.DB) {
-        if (env.LOGGING_ENABLED === "true") console.error("[handleAdminCreateUser] D1 Database (env.DB) is not configured.");
-        return errorResponse(env, "Database service is not configured.", 500);
-    }
-    if (!env.MASTER_ENCRYPTION_KEY) {
-        if (env.LOGGING_ENABLED === "true") console.error("[handleAdminCreateUser] MASTER_ENCRYPTION_KEY secret is not configured.");
-        return errorResponse(env, "Master encryption key is not configured.", 500);
+    if (!env.DB || !env.MASTER_ENCRYPTION_KEY) {
+        return errorResponse(env, "Server configuration error (DB or MEK).", 500);
     }
 
 
     try {
-        // 2. 检查用户是否已存在 (通过尝试获取其密钥)
-        // 注意：getUserSymmetricKey 内部会处理用户不存在或密钥不存在的情况并返回 null
-        // 我们也可以直接查询 Users 表。为简单起见，复用 getUserSymmetricKey 的检查。
-        // 或者更直接：
         const checkUserStmt = env.DB.prepare("SELECT user_id FROM Users WHERE user_id = ?");
         const existingUser = await checkUserStmt.bind(username).first();
 
         if (existingUser) {
             if (env.LOGGING_ENABLED === "true") console.warn(`[handleAdminCreateUser] Attempt to create existing user: '${username}'`);
-            return errorResponse(env, `User '${username}' already exists.`, 409); // 409 Conflict
+            return errorResponse(env, `User '${username}' already exists.`, 409);
         }
 
-        // 3. 为新用户生成对称加密密钥 (CryptoKey object)
-        const userCryptoKey = await generateAesGcmKey(); // from utils/crypto.js
+        const userCryptoKey = await generateAesGcmKey();
         if (!userCryptoKey) {
              if (env.LOGGING_ENABLED === "true") console.error(`[handleAdminCreateUser] Failed to generate user symmetric key for '${username}'`);
             return errorResponse(env, "Failed to generate user encryption key.", 500);
         }
         
-        // 4. 将 CryptoKey 导出为原始 ArrayBuffer 以便用 MEK 加密
         const userRawKeyBuffer = await exportCryptoKeyToRaw(userCryptoKey);
         if (!userRawKeyBuffer) {
             if (env.LOGGING_ENABLED === "true") console.error(`[handleAdminCreateUser] Failed to export user symmetric key to raw format for '${username}'`);
             return errorResponse(env, "Failed to process user encryption key.", 500);
         }
 
-        // 5. 使用 MEK 加密用户密钥并存储到 D1
-        // storeEncryptedUserKey 函数 (from services/d1Database.js) 内部会处理 MEK 加密和 D1 存储
-        const storedSuccessfully = await storeEncryptedUserKey(env, username, userRawKeyBuffer);
+        const storedInD1Successfully = await storeEncryptedUserKey(env, username, userRawKeyBuffer);
 
-        if (!storedSuccessfully) {
+        if (!storedInD1Successfully) {
             if (env.LOGGING_ENABLED === "true") console.error(`[handleAdminCreateUser] Failed to store encrypted key for user '${username}' in D1.`);
-            return errorResponse(env, `Failed to create user '${username}' due to a storage error.`, 500);
+            return errorResponse(env, `Failed to create user '${username}' due to a D1 storage error.`, 500);
         }
+
+        // --- 新增：初始化 GitHub 用户目录和空的 index.json ---
+        const owner = env.GITHUB_REPO_OWNER;
+        const repo = env.GITHUB_REPO_NAME;
+        const targetBranch = env.TARGET_BRANCH || "main";
+        const userIndexPath = `${username}/index.json`;
+        const emptyIndexContent = JSON.stringify({ files: {} }, null, 2);
+        const emptyIndexBase64 = arrayBufferToBase64(new TextEncoder().encode(emptyIndexContent)); // 使用 crypto.js 中的辅助函数
+        const initCommitMessage = `Chore: Initialize index.json for new user ${username}`;
 
         if (env.LOGGING_ENABLED === "true") {
-            console.log(`[handleAdminCreateUser] User '${username}' created successfully by admin.`);
+            console.log(`[handleAdminCreateUser] Initializing GitHub structure for user '${username}' at path '${userIndexPath}'`);
+        }
+
+        const githubInitResult = await ensureFileExists(env, owner, repo, userIndexPath, targetBranch, emptyIndexBase64, initCommitMessage);
+
+        if (githubInitResult.error && githubInitResult.status !== 200) { // 200 表示可能已存在
+            // 如果创建失败 (非 "已存在" 的情况)
+            if (env.LOGGING_ENABLED === "true") {
+                console.error(`[handleAdminCreateUser] Failed to initialize GitHub index.json for user '${username}'. Error: ${githubInitResult.message}. D1 record was created but GitHub init failed.`);
+            }
+            // 这是一个半成功状态：D1 用户已创建，但 GitHub 结构初始化失败。
+            // 可以选择返回一个警告性的成功，或者一个特定的错误码。
+            // 为了简单，我们这里还是返回成功，但附加警告信息，或者让管理员知道需要检查。
+            // 更好的做法是尝试回滚 D1 的创建，但这会增加复杂性。
+            return jsonResponse({
+                message: `User '${username}' created in D1, but GitHub initialization might have failed: ${githubInitResult.message}. Please verify GitHub structure.`,
+                username: username,
+                d1_status: "created",
+                github_status: "initialization_failed",
+                github_error: githubInitResult
+            }, 207); // 207 Multi-Status
+        }
+        // ----------------------------------------------------
+
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[handleAdminCreateUser] User '${username}' created successfully in D1 and GitHub structure initialized.`);
         }
         return jsonResponse({
-            message: `User '${username}' created successfully.`,
+            message: `User '${username}' created successfully. GitHub structure initialized.`,
             username: username
-        }, 201); // 201 Created
+        }, 201);
 
     } catch (error) {
         if (env.LOGGING_ENABLED === "true") {

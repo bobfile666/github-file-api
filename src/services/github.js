@@ -194,3 +194,40 @@ export async function deleteGitHubFile(env, owner, repo, path, branch, sha, comm
     // responseData.status 会被 githubApiRequest 附加
     return responseData;
 }
+
+
+/**
+ * 新添加的函数 或 修改 createFileOrUpdateFile 以适应此场景
+ * 确保在指定路径创建一个（可能是空的）文件，通常用于初始化如 index.json。
+ * 如果文件已存在，此操作可能根据 GitHub API 行为报错或无操作。
+ * 我们这里利用 createFileOrUpdateFile，如果 sha 为 null 且文件不存在，它会创建。
+ * @param {object} env - Worker 环境变量
+ * @param {string} owner - 仓库所有者
+ * @param {string} repo - 仓库名
+ * @param {string} path - 要创建的文件的完整路径 (e.g., "username/index.json")
+ * @param {string} branch - 分支名
+ * @param {string} initialContentBase64 - 文件的初始 Base64 编码内容 (e.g., 空 JSON 对象的 Base64)
+ * @param {string} commitMessage - Git 提交信息
+ * @returns {Promise<object>} - GitHub API 响应或错误对象
+ */
+export async function ensureFileExists(env, owner, repo, path, branch, initialContentBase64, commitMessage) {
+    // 功能：确保指定路径的文件存在，如果不存在则使用提供的内容创建它。
+    // 参数：env, owner, repo, path, branch, initialContentBase64, commitMessage
+    // 返回：Promise<object> - GitHub API 的响应
+
+    // 首先检查文件是否已存在，避免不必要的创建尝试或错误
+    const existingFile = await getFileShaFromPath(env, owner, repo, path, branch);
+    if (existingFile) {
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[ensureFileExists] File ${path} already exists on branch ${branch}. No action needed.`);
+        }
+        // 返回一个模拟的成功响应或实际的 existingFile 数据
+        return { success: true, status: 200, message: "File already exists.", content: existingFile };
+    }
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[ensureFileExists] File ${path} does not exist on branch ${branch}. Attempting to create.`);
+    }
+    // 文件不存在，调用 createFileOrUpdateFile (sha 为 null) 来创建
+    return createFileOrUpdateFile(env, owner, repo, path, branch, initialContentBase64, commitMessage, null);
+}
