@@ -12,6 +12,7 @@ import {
 
 import { handleRequestDynamicToken } from './handlers/auth.js'; // 引入 auth handler
 import { verifyAndDecodeDynamicToken } from './utils/crypto.js'; // 引入 crypto 工具
+import { handleAdminCreateUser } from './handlers/admin.js'; // 新增导入
 
 // 新增：认证中间件/函数
 /**
@@ -81,9 +82,14 @@ export default {
         const apiVersionPrefix = `/${env.API_VERSION || 'v1'}`;
 
         try {
-            // 认证端点 (不需要令牌认证自身)
+            // --- 管理员端点 ---
+            if (pathname === `${apiVersionPrefix}/admin/users/create`) {
+                return await handleAdminCreateUser(request, env, ctx);
+            }
+
+            // --- 认证端点 ---
             if (pathname === `${apiVersionPrefix}/auth/request-token`) {
-                return await handleRequestDynamicToken(request, env, ctx);
+                return await handleRequestDynamicToken(request, env, ctx); // 确保此函数已导入
             }
 
             // 受保护的文件操作端点
@@ -151,32 +157,27 @@ export default {
  * @param {Request} request
  * @returns {Response}
  */
+// 确保 handleOptions 和其他辅助函数 (如 base64 转换) 在此文件或导入的文件中可用
 function handleOptions(request) {
+    // 功能：处理 CORS 预检请求。
     const headers = request.headers;
     if (
         headers.get('Origin') !== null &&
         headers.get('Access-Control-Request-Method') !== null &&
         headers.get('Access-Control-Request-Headers') !== null
     ) {
-        // Handle CORS preflight requests.
         return new Response(null, {
             headers: {
                 'Access-Control-Allow-Origin': '*', // 生产环境应配置为特定源
                 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Commit-Message, X-API-Key', // 确保包含你客户端会发送的所有头部
-                'Access-Control-Max-Age': '86400', // 24 hours
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Commit-Message, X-API-Key, X-Admin-API-Key', // 添加 X-Admin-API-Key
+                'Access-Control-Max-Age': '86400', 
             },
         });
     } else {
-        // Handle standard OPTIONS request.
-        return new Response(null, {
-            headers: {
-                Allow: 'GET, POST, PUT, DELETE, OPTIONS',
-            },
-        });
+        return new Response(null, { headers: { Allow: 'GET, POST, PUT, DELETE, OPTIONS' } });
     }
 }
-
 // 辅助函数 (暂时放在这里，后续可以移到 utils/crypto.js 或 utils/converters.js)
 function arrayBufferToBase64(buffer) {
     let binary = '';
