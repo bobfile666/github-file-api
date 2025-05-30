@@ -6,7 +6,7 @@ compatibility_date = "2024-03-15" # 请使用一个较新的日期
 # -- Variables (non-secret, accessible via env.VAR_NAME) --
 [vars]
 GITHUB_REPO_OWNER = "bobfile666"  # 替换为你的
-GITHUB_REPO_NAME = "github-file-api"      # 替换为你的
+GITHUB_REPO_NAME = "bob-files"      # 替换为你的
 TARGET_BRANCH = "main"
 LOGGING_ENABLED = "true"
 # API_VERSION = "v1" # 可选

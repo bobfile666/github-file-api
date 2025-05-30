@@ -82,8 +82,8 @@ async function updateUserIndex(env, username, indexData, currentSha, targetBranc
 // --- 导出的请求处理函数 ---
 
 export async function handleFileUpload(request, env, ctx, authenticatedUsername, originalFilePath) {
-    // 功能：处理文件上传，包括速率限制、加密、GitHub 存储、索引更新、KV 时间戳更新和日志记录。
-    // (代码和之前一样)
+    // 功能：处理文件上传，包括唯一原始文件名检查、速率限制、加密、GitHub 存储、索引更新、KV 时间戳更新和日志记录。
+    // (函数开始部分的参数检查和日志初始化与之前类似)
     if (!authenticatedUsername || !originalFilePath) {
         return errorResponse(env, "Authenticated username and original file path are required for upload.", 400);
     }
@@ -92,10 +92,11 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
         console.log(`[handleFileUpload] User: ${authenticatedUsername} - Initiating upload for: ${originalFilePath}`);
     }
 
+    // ---- 1. 速率限制检查 ----
     const UPLOAD_INTERVAL_SECONDS = parseInt(env.UPLOAD_INTERVAL_SECONDS || "10", 10);
     const currentTimeMs = Date.now();
+    // ... (速率限制检查逻辑和之前一样)
     const lastUploadTimeMs = await kvService.getLastUploadTimestamp(env, authenticatedUsername);
-
     if (lastUploadTimeMs && (currentTimeMs - lastUploadTimeMs) < (UPLOAD_INTERVAL_SECONDS * 1000)) {
         const waitSeconds = Math.ceil(((UPLOAD_INTERVAL_SECONDS * 1000) - (currentTimeMs - lastUploadTimeMs)) / 1000);
         if (env.LOGGING_ENABLED === "true") {
@@ -103,12 +104,13 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
         }
         return errorResponse(env, `Too many upload requests. Please wait ${waitSeconds} seconds.`, 429);
     }
+    // -------------------------
 
     const owner = env.GITHUB_REPO_OWNER;
     const repo = env.GITHUB_REPO_NAME;
     const targetBranch = env.TARGET_BRANCH || "main";
     
-    let logEntry = { 
+    let logEntry = { /* ... (logEntry 初始化和之前一样) ... */ 
         user_id: authenticatedUsername,
         action_type: 'upload',
         original_file_path: originalFilePath,
@@ -126,19 +128,37 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
 
         if (plainContentArrayBuffer.byteLength === 0) {
             logEntry.error_message = "Cannot upload an empty file.";
+            // ... (记录日志并返回错误)
             if (env.LOGGING_ENABLED === "true") console.warn(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message}`);
             ctx.waitUntil(logFileActivity(env, logEntry));
             return errorResponse(env, logEntry.error_message, 400);
         }
 
+        // ---- 2. 获取用户索引并检查原始文件名是否已存在 ----
+        const { indexData, sha: indexSha } = await getUserIndex(env, authenticatedUsername, targetBranch);
+        if (indexData && indexData.files && indexData.files[originalFilePath]) {
+            logEntry.error_message = `File with the name '${originalFilePath}' already exists for this user. Upload aborted to prevent overwrite.`;
+            if (env.LOGGING_ENABLED === "true") {
+                console.warn(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message}`);
+            }
+            ctx.waitUntil(logFileActivity(env, logEntry));
+            return errorResponse(env, logEntry.error_message, 409); // 409 Conflict
+        }
+        // ------------------------------------------------
+
+        // ---- 3. 获取用户文件加密密钥 ----
+        // ... (逻辑和之前一样: getUserSymmetricKey)
         const userFileEncryptionKey = await getUserSymmetricKey(env, authenticatedUsername);
         if (!userFileEncryptionKey) {
             logEntry.error_message = `Encryption key not found for user.`;
             if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message}`);
             ctx.waitUntil(logFileActivity(env, logEntry));
-            return errorResponse(env, `Could not retrieve encryption key for user '${authenticatedUsername}'. User may not exist or setup is incomplete.`, 403);
+            return errorResponse(env, `Could not retrieve encryption key for user '${authenticatedUsername}'. Setup may be incomplete.`, 403);
         }
+        // ---------------------------------
         
+        // ---- 4. 加密文件内容 ----
+        // ... (逻辑和之前一样: encryptDataAesGcm)
         let encryptedData;
         try {
             encryptedData = await encryptDataAesGcm(plainContentArrayBuffer, userFileEncryptionKey);
@@ -152,7 +172,9 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
         ivAndCiphertextBuffer.set(encryptedData.iv, 0);
         ivAndCiphertextBuffer.set(new Uint8Array(encryptedData.ciphertext), encryptedData.iv.byteLength);
         const contentToUploadBase64 = arrayBufferToBase64(ivAndCiphertextBuffer.buffer);
-        
+        // ---------------------------
+
+        // ---- 5. 计算原始文件内容的哈希 ----
         const fileHash = await calculateSha256(plainContentArrayBuffer);
         logEntry.file_hash = fileHash;
         const hashedFilePath = `${authenticatedUsername}/${fileHash}`; 
@@ -161,11 +183,10 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
             console.log(`[handleFileUpload] User: ${authenticatedUsername} - Encrypted. Original='${originalFilePath}', Hash='${fileHash}', TargetPath='${hashedFilePath}'`);
         }
 
-        const { indexData, sha: indexSha } = await getUserIndex(env, authenticatedUsername, targetBranch);
-
+        // ---- 6. 上传已加密的物理文件到 GitHub ----
+        // (逻辑和之前一样：检查哈希文件是否存在，如果不存在则创建)
         const fileCommitMessage = `Chore: Upload encrypted content ${fileHash} for user ${authenticatedUsername} (file: ${originalFilePath})`;
         const existingHashedFile = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
-        
         if (!existingHashedFile) { 
             const uploadResult = await githubService.createFileOrUpdateFile(env, owner, repo, hashedFilePath, targetBranch, contentToUploadBase64, fileCommitMessage, null);
             if (uploadResult.error) {
@@ -178,30 +199,40 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
         } else {
             if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - Encrypted file for hash ${fileHash} already exists on GitHub. Skipping physical upload.`);
         }
+        // -----------------------------------------
         
-        if (!indexData.files) indexData.files = {};
+        // ---- 7. 更新索引 ----
+        if (!indexData.files) indexData.files = {}; // 确保 files 对象存在
         indexData.files[originalFilePath] = fileHash; 
-        const indexCommitMessage = `Feat: Update index for ${authenticatedUsername}, maps '${originalFilePath}' to '${fileHash}'`;
+        const indexCommitMessage = `Feat: Update index for ${authenticatedUsername}, add '${originalFilePath}' mapping to '${fileHash}'`;
         const indexUpdated = await updateUserIndex(env, authenticatedUsername, indexData, indexSha, targetBranch, indexCommitMessage);
 
         if (!indexUpdated) {
             logEntry.error_message = "GitHub: Failed to update user index after file upload.";
-            if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message} Physical file ${hashedFilePath} might be orphaned.`);
+            // ... (记录日志并返回错误)
+            if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - ${logEntry.error_message} Physical file ${hashedFilePath} might be orphaned if newly created.`);
             ctx.waitUntil(logFileActivity(env, logEntry));
             return errorResponse(env, "Encrypted file content possibly uploaded, but failed to update user index.", 500);
         }
+        // --------------------
 
-        const kvTimestampTtl = parseInt(env.KV_TIMESTAMP_TTL_SECONDS || (UPLOAD_INTERVAL_SECONDS * 60 * 24).toString(), 10);
+        // ---- 8. 更新KV速率限制时间戳 ----
+        // ... (逻辑和之前一样: updateLastUploadTimestamp)
+        const kvTimestampTtl = parseInt(env.KV_TIMESTAMP_TTL_SECONDS || (UPLOAD_INTERVAL_SECONDS * 60 * 24).toString(), 10); // 例如24小时TTL
         ctx.waitUntil(kvService.updateLastUploadTimestamp(env, authenticatedUsername, currentTimeMs, kvTimestampTtl ));
+        // ------------------------------
         
+        // ---- 9. 记录成功日志 ----
         logEntry.status = 'success';
         ctx.waitUntil(logFileActivity(env, logEntry));
+        // ----------------------
 
         if (env.LOGGING_ENABLED === "true") {
             console.log(`[handleFileUpload] User: ${authenticatedUsername} - Successfully processed upload for ${originalFilePath}`);
         }
         return jsonResponse({
-            message: `File '${originalFilePath}' (as '${fileHash}') encrypted and processed successfully for user '${authenticatedUsername}'.`,
+            message: `File '${originalFilePath}' (as '${fileHash}') encrypted and uploaded successfully for user '${authenticatedUsername}'.`,
+            // ... (其他响应字段和之前一样)
             username: authenticatedUsername,
             originalPath: originalFilePath,
             filePathInRepo: hashedFilePath,
@@ -210,8 +241,9 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
         }, 201);
 
     } catch (error) {
+        // ... (通用错误处理和日志记录，和之前一样)
         if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] User: ${authenticatedUsername} - Unexpected error for ${originalFilePath}:`, error.message, error.stack);
-        logEntry.error_message = `Server error: ${error.message.substring(0, 255)}`;
+        logEntry.error_message = `Server error: ${error.message.substring(0, 255)}`; // 限制错误信息长度
         ctx.waitUntil(logFileActivity(env, logEntry));
         return errorResponse(env, "An unexpected server error occurred during file upload.", 500);
     }
