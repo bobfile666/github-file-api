@@ -30,11 +30,12 @@ database_id = "07be31d3-dda3-4473-9f79-f749ad54b8cf" # 粘贴你从 Dashboard �
 # DYNAMIC_TOKEN_SECRET
 # MASTER_ENCRYPTION_KEY
 
-# 新增：Cron Triggers
-# "*/5 * * * *"  每 5 分钟
-# "0 */2 * * *"  每 2 小时的第 0 分钟运行 (00:00, 02:00, 04:00, etc.)
+# Cron Triggers
 [triggers]
-crons = ["0 */2 * * *"]
+crons = [
+  "0 */2 * * *",  # 每 2 小时运行一次 (用于生成报告)
+  "0 3 * * 1"     # 每周一凌晨 3 点运行 (用于错误文件检查/维护)
+]
 
 # wrangler.toml (wrangler v3.88.0^)
 [observability.logs]
