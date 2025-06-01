@@ -292,45 +292,96 @@ async function getUserIndexForScheduledTask(env, username) {
  */
 async function generateAndPushStatusReport(event, env) {
     // 功能：生成关于用户统计和近期活动的报告，并推送到 GitHub。
-    // 参数：event, env
-    // 返回：Promise<void>
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[StatusReportTask] Starting - Triggered by: ${event.cron}`);
     }
     let reportContent = `# System Status Report - ${new Date(event.scheduledTime).toISOString()}\n\n`;
 
-    // 获取用户总数
+    // --- 用户统计 ---
     if (env.DB) {
-        const countStmt = env.DB.prepare("SELECT COUNT(*) as total_users FROM Users WHERE status = 'active'"); // 只统计活跃用户
+        const countStmt = env.DB.prepare("SELECT COUNT(*) as total_users FROM Users WHERE status = 'active'");
         const countResult = await countStmt.first();
         reportContent += `## User Statistics\n- Active Users: ${countResult ? countResult.total_users : 0}\n\n`;
     } else {
         reportContent += `- User statistics unavailable (D1 DB not configured).\n\n`;
     }
 
-    // 获取最近上传活动
+    // --- 近期活动 (例如过去 24 小时) ---
     if (env.DB) {
-        reportContent += `## Recent Activity (Last 2-24 Hours - depending on cron)\n`;
-        // 根据 cron 表达式调整查询范围，这里简化为固定范围或不调整
-        const activityTimeLimit = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); 
-        const activityStmt = env.DB.prepare( /* ... 你的活动查询 SQL ... */ 
-            "SELECT user_id, action_type, COUNT(*) as count FROM FileActivityLogs WHERE logged_at >= ? AND status = 'success' GROUP BY user_id, action_type ORDER BY count DESC LIMIT 10"
-        ).bind(activityTimeLimit);
-        const { results: recentActivities } = await activityStmt.all();
-        if (recentActivities && recentActivities.length > 0) {
-            reportContent += `| User ID | Action | Count |\n|---------|--------|-------|\n`;
-            recentActivities.forEach(act => {
-                reportContent += `| ${act.user_id} | ${act.action_type} | ${act.count} |\n`;
-            });
+        reportContent += `## Recent Activity Summary (Last 24 Hours)\n`;
+        const activityTimeLimit = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        
+        // 1. 按用户和操作类型统计成功次数
+        const successActivityStmt = env.DB.prepare(
+            "SELECT user_id, action_type, COUNT(*) as success_count, SUM(CASE WHEN action_type = 'upload' THEN file_size_bytes ELSE 0 END) as total_upload_size " +
+            "FROM FileActivityLogs " +
+            "WHERE logged_at >= ? AND status = 'success' " +
+            "GROUP BY user_id, action_type " +
+            "ORDER BY success_count DESC, total_upload_size DESC LIMIT 15"
+        );
+        const { results: successActivities } = await successActivityStmt.bind(activityTimeLimit).all();
+
+        if (successActivities && successActivities.length > 0) {
+            reportContent += `### Top Successful Activities:\n`;
+            reportContent += `| User ID        | Action   | Success Count | Total Upload Size (Bytes) |\n`;
+            reportContent += `|----------------|----------|---------------|---------------------------|\n`;
+            for (const activity of successActivities) {
+                reportContent += `| ${activity.user_id.padEnd(14)} | ${activity.action_type.padEnd(8)} | ${String(activity.success_count).padEnd(13)} | ${activity.action_type === 'upload' ? String(activity.total_upload_size || 0).padEnd(25) : 'N/A'.padEnd(25)} |\n`;
+            }
         } else {
-            reportContent += `- No significant successful activity recently.\n`;
+            reportContent += `- No successful activities recorded in the last 24 hours.\n`;
         }
         reportContent += `\n`;
+
+        // 2. 按用户和操作类型统计失败次数
+        const failureActivityStmt = env.DB.prepare(
+            "SELECT user_id, action_type, COUNT(*) as failure_count, GROUP_CONCAT(DISTINCT SUBSTR(error_message, 1, 30)) as common_errors " + // 显示常见的错误信息（截断）
+            "FROM FileActivityLogs " +
+            "WHERE logged_at >= ? AND status = 'failure' " +
+            "GROUP BY user_id, action_type " +
+            "ORDER BY failure_count DESC LIMIT 10"
+        );
+        const { results: failureActivities } = await failureActivityStmt.bind(activityTimeLimit).all();
+
+        if (failureActivities && failureActivities.length > 0) {
+            reportContent += `### Top Failed Activities:\n`;
+            reportContent += `| User ID        | Action   | Failure Count | Common Errors (truncated)    |\n`;
+            reportContent += `|----------------|----------|---------------|------------------------------|\n`;
+            for (const activity of failureActivities) {
+                reportContent += `| ${activity.user_id.padEnd(14)} | ${activity.action_type.padEnd(8)} | ${String(activity.failure_count).padEnd(13)} | ${(activity.common_errors || 'N/A').padEnd(28)} |\n`;
+            }
+        } else {
+            reportContent += `- No failed activities recorded in the last 24 hours.\n`;
+        }
+        reportContent += `\n`;
+
+        // 3. 最近的几条详细日志 (示例)
+        reportContent += `### Latest Activity Details (Sample - Max 10):\n`;
+        const latestDetailsStmt = env.DB.prepare(
+            "SELECT logged_at, user_id, action_type, SUBSTR(original_file_path, 1, 40) as path_preview, status, SUBSTR(error_message, 1, 30) as error_preview " +
+            "FROM FileActivityLogs " +
+            "WHERE logged_at >= ? " +
+            "ORDER BY logged_at DESC LIMIT 10"
+        );
+        const { results: latestDetails } = await latestDetailsStmt.bind(activityTimeLimit).all();
+        if (latestDetails && latestDetails.length > 0) {
+            reportContent += `| Timestamp (UTC)       | User ID        | Action   | Path Preview (40 chars)      | Status  | Error Preview (30 chars) |\n`;
+            reportContent += `|-----------------------|----------------|----------|------------------------------|---------|--------------------------|\n`;
+            for (const detail of latestDetails) {
+                const ts = detail.logged_at.replace('T', ' ').substring(0, 19);
+                reportContent += `| ${ts.padEnd(21)} | ${detail.user_id.padEnd(14)} | ${detail.action_type.padEnd(8)} | ${(detail.path_preview || '').padEnd(28)} | ${detail.status.padEnd(7)} | ${(detail.error_preview || 'N/A').padEnd(24)} |\n`;
+            }
+        } else {
+            reportContent += `- No detailed activity entries in the last 24 hours.\n`;
+        }
+        reportContent += `\n`;
+
+
     } else {
-        reportContent += `- Recent activity unavailable (D1 DB not configured).\n\n`;
+         reportContent += `- Recent activity unavailable (D1 DB not configured).\n\n`;
     }
     
-    // 推送报告
+    // ... (报告推送逻辑和之前一样) ...
     const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
     const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
     const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
@@ -340,16 +391,20 @@ async function generateAndPushStatusReport(event, env) {
     const reportFileName = `${reportTimestamp}_status_report.md`;
     const reportFullPath = `${reportPathPrefix.endsWith('/') ? reportPathPrefix : reportPathPrefix + '/'}${reportFileName}`;
     
-    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent));
+    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent)); // 确保 arrayBufferToBase64 从 crypto.js 导入
     const commitMessage = `System Status Report: ${reportTimestamp}`;
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[StatusReportTask] Attempting to push status report to: ${reportRepoOwner}/${reportRepoName} - ${reportFullPath}`);
+    }
 
     const existingReportSha = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, reportFullPath, reportRepoBranch))?.sha;
     const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, reportFullPath, reportRepoBranch, reportContentBase64, commitMessage, existingReportSha);
 
     if (pushResult.error) {
-        console.error(`[StatusReportTask] Failed to push status report: ${pushResult.message}`, pushResult.details);
+        console.error(`[StatusReportTask] Failed to push status report: ${pushResult.message}`, pushResult.details ? JSON.stringify(pushResult.details).substring(0,500) : '');
     } else {
-        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Status report pushed. Commit: ${pushResult.commit?.sha || 'N/A'}`);
+        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Status report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
     }
 }
 

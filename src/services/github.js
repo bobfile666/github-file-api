@@ -11,7 +11,14 @@ const GITHUB_API_BASE = 'https://api.github.com';
  * @param {object} [body=null] - 请求体 (如果是 POST/PUT/DELETE)
  * @returns {Promise<object>} - 解析后的 JSON 响应或错误对象
  */
+// src/services/github.js
+
+// async function githubApiRequest(url, method, pat, body = null, envForLogging) { /* ... */ }
+// (此函数需要修改其错误处理部分)
 async function githubApiRequest(url, method, pat, body = null, envForLogging) {
+    // 功能：通用的 GitHub API 请求辅助函数。
+    // 参数：url, method, pat, body (可选), envForLogging (可选，用于日志记录)
+    // 返回：Promise<object> - 解析后的 JSON 响应或自定义的错误/成功对象
     const headers = {
         'Authorization': `token ${pat}`,
         'User-Agent': 'Cloudflare-Worker-GitHub-File-API',
@@ -22,8 +29,15 @@ async function githubApiRequest(url, method, pat, body = null, envForLogging) {
     }
 
     if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
-        console.log(`GitHub API Request: ${method} ${url}`);
-        if (body) console.log(`GitHub API Body (partial for brevity): ${JSON.stringify(body).substring(0, 200)}...`);
+        console.log(`[GitHubAPI] Request: ${method} ${url}`);
+        if (body && method !== 'GET' && method !== 'HEAD') { // 只记录非 GET/HEAD 的 body
+             try {
+                const bodyString = JSON.stringify(body);
+                console.log(`[GitHubAPI] Body (first 200 chars): ${bodyString.substring(0, 200)}${bodyString.length > 200 ? '...' : ''}`);
+            } catch (e) {
+                console.warn("[GitHubAPI] Could not stringify body for logging.");
+            }
+        }
     }
 
     try {
@@ -33,40 +47,86 @@ async function githubApiRequest(url, method, pat, body = null, envForLogging) {
             body: body ? JSON.stringify(body) : null,
         });
 
-        // 对于 204 No Content (例如成功删除但无返回体)，直接返回成功标记
-        if (response.status === 204) {
-            return { success: true, status: 204 };
+        if (response.status === 204) { // No Content (e.g., successful DELETE)
+            if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
+                console.log(`[GitHubAPI] Response: ${method} ${url} - Status 204 No Content`);
+            }
+            return { success: true, status: 204, commit: {sha: null} }; // GitHub delete API sometimes returns commit in header, not body
         }
         
-        const responseData = await response.json().catch(e => {
-            // 如果响应体不是 JSON (例如某些错误情况或空的 201)
+        // 尝试解析 JSON，即使对于错误响应，GitHub 也可能返回 JSON 错误体
+        let responseData = {};
+        const contentType = response.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+            try {
+                responseData = await response.json();
+            } catch (e) {
+                // 如果声明是 JSON 但解析失败
+                if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
+                    console.warn(`[GitHubAPI] Response for ${method} ${url} (Status: ${response.status}) declared JSON but failed to parse:`, e.message);
+                }
+                // 如果不是成功状态码，这仍然是一个错误
+                if (!response.ok) {
+                    return { error: true, message: `GitHub API Error: Declared JSON but failed to parse. Status: ${response.status}`, status: response.status, details: { rawError: e.message } };
+                }
+                // 如果是成功状态码但 JSON 解析失败 (例如空的 201)，特殊处理
+                if (response.status === 201 && (response.headers.get('content-length') === '0' || !await response.clone().text()) ) {
+                     if (envForLogging && envForLogging.LOGGING_ENABLED === "true") console.log(`[GitHubAPI] Response: ${method} ${url} - Status 201 Created (No JSON body or empty)`);
+                    return { success: true, status: 201, message: "Created (No JSON body)", content: null, commit: {sha: null} }; // 模拟一个成功的结构
+                }
+            }
+        } else if (!response.ok) {
+            // 如果不是 JSON 且不是 OK，尝试读取文本
+            const errorText = await response.text().catch(() => "Could not read error text");
             if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
-                console.warn(`GitHub API response for ${method} ${url} was not valid JSON or empty. Status: ${response.status}`);
+                 console.error(`[GitHubAPI] Error (Non-JSON): ${method} ${url} - Status: ${response.status}, Body: ${errorText.substring(0,100)}`);
             }
-            // 对于成功的创建 (201) 但空 body 的情况，也认为是成功的
-            if (response.status === 201 && response.headers.get('content-length') === '0') {
-                return { success: true, status: 201, message: "Created but no content in response body." };
-            }
-            return { error: true, message: `Response not JSON: ${e.message}`, status: response.status, rawResponse: response };
-        });
+            return { error: true, message: errorText.substring(0,100) || `GitHub API Error (Status: ${response.status})`, status: response.status, details: {rawText: errorText} };
+        }
+
 
         if (!response.ok) {
-            // 将 GitHub 的错误信息和状态码包装起来
-            const errorMessage = responseData.message || `GitHub API Error (Status: ${response.status})`;
-            if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
-                console.error(`GitHub API Error: ${method} ${url} - Status: ${response.status}, Message: ${errorMessage}`, responseData);
+            // 特别处理 GET 请求的 404 Not Found，不视为严重错误打印
+            if (method === 'GET' && response.status === 404) {
+                if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
+                    console.log(`[GitHubAPI] Info: ${method} ${url} - Status 404 Not Found (File/Resource does not exist)`);
+                }
+            } else { // 其他错误，用 console.error
+                if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
+                    const errorMessage = responseData.message || (typeof responseData === 'string' ? responseData : `GitHub API Error (Status: ${response.status})`);
+                    console.error(`[GitHubAPI] Error: ${method} ${url} - Status: ${response.status}, Message: ${errorMessage}`, responseData);
+                }
             }
-            return { error: true, message: errorMessage, status: response.status, details: responseData };
+            // 将 GitHub 的错误信息和状态码包装起来
+            return { 
+                error: true, 
+                message: responseData.message || (typeof responseData === 'string' ? responseData : `GitHub API Error (Status: ${response.status})`), 
+                status: response.status, 
+                details: responseData 
+            };
         }
+        
         // 将状态码附加到成功响应上，便于调用者判断
-        responseData.status = response.status;
+        if (typeof responseData === 'object' && responseData !== null) {
+            responseData.status = response.status;
+        } else if (typeof responseData !== 'object') { 
+            // 如果 responseData 不是对象（例如，GitHub API 在某些情况下返回简单字符串或 null）
+            // 但状态是 OK，我们包装一下
+            if (envForLogging && envForLogging.LOGGING_ENABLED === "true") console.log(`[GitHubAPI] Response: ${method} ${url} - Status ${response.status}. Received non-object data:`, responseData);
+            return { success: true, status: response.status, data: responseData, message: "Received non-object success data." };
+        }
+
+
+        if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
+            console.log(`[GitHubAPI] Response: ${method} ${url} - Status ${response.status} OK.`);
+        }
         return responseData;
 
-    } catch (error) {
+    } catch (error) { // 网络错误或其他 fetch 本身的错误
         if (envForLogging && envForLogging.LOGGING_ENABLED === "true") {
-            console.error(`Network or parsing error during GitHub API request: ${method} ${url}`, error.message, error.stack);
+            console.error(`[GitHubAPI] Network/Fetch Error: ${method} ${url}`, error.message, error.stack);
         }
-        return { error: true, message: error.message, status: 500, type: 'network_or_parsing_error' };
+        return { error: true, message: `Network/Fetch error: ${error.message}`, status: 0, type: 'network_or_fetch_error' }; // status 0 for network errors
     }
 }
 

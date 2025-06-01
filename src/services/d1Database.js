@@ -123,9 +123,9 @@ export async function storeEncryptedUserKey(env, username, rawUserKeyBuffer) {
  * @property {string} [user_agent]
  * @returns {Promise<void>}
  */
-export async function logFileActivity(env, logData) { // <-- 重命名函数
-    // 功能：向 D1 数据库记录文件操作日志。
-    // 参数：env, logData (包含日志详情的对象)
+export async function logFileActivity(env, logData) {
+    // 功能：向 D1 数据库记录文件操作日志，现在包括操作耗时。
+    // 参数：env, logData (包含日志详情的对象，包括可选的 duration_ms)
     // 返回：无 (Promise<void>)
     if (!env.DB) {
         if (env.LOGGING_ENABLED === "true") console.warn("D1_NOT_CONFIGURED: Activity log not saved.", logData);
@@ -134,20 +134,20 @@ export async function logFileActivity(env, logData) { // <-- 重命名函数
     try {
         const {
             user_id,
-            action_type = 'unknown', // 添加默认值
+            action_type = 'unknown',
             original_file_path,
             file_hash = null, 
             file_size_bytes = null,
             status,
+            duration_ms = null, // 新增：操作耗时 (毫秒)
             error_message = null,
             source_ip = null,
             user_agent = null
         } = logData;
         const logged_at = new Date().toISOString();
 
-        // 假设你已将表 UploadLogs 重命名为 FileActivityLogs 并添加了 action_type 列
         const stmt = env.DB.prepare(
-            "INSERT INTO FileActivityLogs (user_id, action_type, original_file_path, file_hash, file_size_bytes, logged_at, status, error_message, source_ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO FileActivityLogs (user_id, action_type, original_file_path, file_hash, file_size_bytes, logged_at, status, duration_ms, error_message, source_ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" // 增加了 duration_ms
         ); 
         
         await stmt.bind(
@@ -158,16 +158,20 @@ export async function logFileActivity(env, logData) { // <-- 重命名函数
             file_size_bytes, 
             logged_at, 
             status, 
+            duration_ms, // 绑定新值
             error_message, 
             source_ip, 
             user_agent
         ).run();
         
-        if (env.LOGGING_ENABLED === "true") console.log(`Activity logged: User='${user_id}', Action='${action_type}', Path='${original_file_path}', Status='${status}'`);
+        if (env.LOGGING_ENABLED === "true") {
+             const durationString = duration_ms !== null ? ` Duration: ${duration_ms}ms` : '';
+            console.log(`[LogActivity] User='${user_id}', Action='${action_type}', Path='${original_file_path}', Status='${status}'${durationString}`);
+        }
 
     } catch (e) {
         if (env.LOGGING_ENABLED === "true") {
-            console.error("Failed to log file activity:", e.message, e.stack, "Log data attempted:", logData);
+            console.error("[LogActivity] Failed to log activity:", e.message, e.stack, "Log data attempted:", logData);
         }
     }
 }
