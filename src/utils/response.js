@@ -27,21 +27,46 @@ export function jsonResponse(data, status = 200, headers = {}) {
  * @param {string} message - 错误消息。
  * @param {number} [status=500] - HTTP 状态码。
  * @param {string} [errorCode] - (可选) 应用特定的错误代码。
+ * @param {object} [additionalDetails=null] - (可选) 附加的错误详情，不会直接在响应中暴露给用户，但可能用于日志。
  * @returns {Response}
  */
-export function errorResponse(env, message, status = 500, errorCode) {
+export function errorResponse(env, message, status = 500, errorCode, additionalDetails = null) {
+    // 功能：创建标准化的错误 JSON 响应。
+    // 参数：env, message, status, errorCode (可选), additionalDetails (可选，用于内部日志)
+    // 返回：Response 对象
     const errorPayload = { error: { message, status } };
     if (errorCode) {
         errorPayload.error.code = errorCode;
     }
 
-    // 只有在 LOGGING_ENABLED 为 "true" 时才记录到控制台
+    // 控制台日志记录 (所有错误，无论 4xx 或 5xx，如果 LOGGING_ENABLED)
     if (env && env.LOGGING_ENABLED === "true") {
-        console.error(`Error Response: Status=${status}, Message='${message}'${errorCode ? `, Code=${errorCode}` : ''}`);
-    } else if (!env) {
-        // 如果 env 没有被正确传递，也记录一个控制台错误，帮助调试
-        console.error(`Error Response (env not provided): Status=${status}, Message='${message}'${errorCode ? `, Code=${errorCode}` : ''}`);
+        let logMessage = `[ErrorResponse] Status=${status}, Message='${message}'${errorCode ? `, Code=${errorCode}` : ''}`;
+        if (additionalDetails) {
+            try {
+                logMessage += `, Details: ${JSON.stringify(additionalDetails).substring(0, 300)}`; // 限制详情长度
+            } catch (e) { /* ignore stringify error */ }
+        }
+        // 根据状态码使用不同日志级别
+        if (status >= 500) {
+            console.error(logMessage);
+        } else if (status >= 400) {
+            console.warn(logMessage);
+        } else {
+            console.log(logMessage); // 其他情况（不常见）
+        }
+    } else if (!env && status >= 400) { // 如果 env 未定义但有错误，至少记录一个警告
+        console.warn(`[ErrorResponse NO ENV] Status=${status}, Message='${message}'`);
     }
 
-    return jsonResponse(errorPayload, status);
+    const defaultHeaders = {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*', 
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Commit-Message, X-API-Key, X-Admin-API-Key',
+    };
+    return new Response(JSON.stringify(errorPayload), {
+        status,
+        headers: defaultHeaders, // 确保 CORS 头在错误响应中也存在
+    });
 }

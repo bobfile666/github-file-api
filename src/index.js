@@ -223,31 +223,54 @@ async function routeRequest(request, env, ctx) {
 
 export default {
     async fetch(request, env, ctx) {
-        // 功能：Worker 的主 fetch 处理函数，调用路由分发器。
+        // ... (开始的日志和 OPTIONS 处理) ...
+        const startTime = Date.now();
+        let response; // 在 try 外部声明，以便 finally 可以访问
+        const rayId = request.headers.get('cf-ray') || `fetch-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
+
+
         if (env && env.LOGGING_ENABLED === "true") {
-            console.log(`[IndexFetch] START: ${request.method} ${request.url}`);
+            console.log(`[IndexFetch] START: ${request.method} ${request.url} Ray: ${rayId}`);
         }
-        
         if (request.method === 'OPTIONS') {
-            return handleOptions(request);
+            return handleOptions(request); // 确保 handleOptions 已定义
         }
 
         try {
-            return await routeRequest(request, env, ctx);
-        } catch (err) {
-            // 捕获所有未处理的顶层错误
-            const rayId = request.headers.get('cf-ray');
+            response = await routeRequest(request, env, ctx); // routeRequest 现在是主要的请求处理器
+        } catch (err) { // 捕获 routeRequest 或其调用的函数中未被捕获的异常
             err.rayId = rayId; 
-            if (env.LOGGING_ENABLED === "true") console.error(`[IndexFetch CRITICAL] Unhandled error for ${request.method} ${request.url} (Ray ID: ${rayId}):`, err.message, err.stack, err);
+            if (env.LOGGING_ENABLED === "true") {
+                console.error(`[IndexFetch CRITICAL] Unhandled error in routeRequest for ${request.method} ${request.url} (Ray ID: ${rayId}):`, err.message, err.stack, err);
+            }
             
-            ctx.waitUntil(logErrorToGitHub(env, 'GlobalFetchError', err, `${request.method} ${request.url}`));
+            // 判断是否为服务器错误 (5xx)
+            // 如果 err 对象有 status 属性且是 5xx，或者没有 status 属性（通常是意外 JS 错误），则认为是服务器错误
+            const isServerError = !err.status || (err.status >= 500 && err.status <= 599);
+            if (isServerError) {
+                ctx.waitUntil(logErrorToGitHub(env, 'GlobalFetchError', err, `${request.method} ${request.url}`));
+            }
             
-            return errorResponse(env, `Internal Server Error. Please contact support if the issue persists. Ray ID: ${rayId || 'N/A'}`, 500);
+            // 响应给客户端的错误
+            // 如果 err 是一个 Response 对象 (例如从 errorResponse 返回的)，直接返回它
+            if (err instanceof Response) {
+                response = err;
+            } else {
+                // 否则，创建一个新的错误响应
+                // 如果错误对象有 status 和 message，优先使用它们
+                const status = (typeof err.status === 'number' && err.status >= 400 && err.status <= 599) ? err.status : 500;
+                const message = err.message || "An unexpected issue occurred.";
+                response = errorResponse(env, `Internal Server Error. Ray ID: ${rayId}`, status, "GLOBAL_ERROR", {originalError: message});
+            }
         } finally {
             if (env && env.LOGGING_ENABLED === "true") {
-                console.log(`[IndexFetch] END: ${request.method} ${request.url}`);
+                const duration = Date.now() - startTime;
+                // 确保 response 对象存在才访问 response.status
+                const statusString = response ? response.status : 'N/A (no response generated)';
+                console.log(`[IndexFetch] END: ${request.method} ${request.url} Status: ${statusString} Duration: ${duration}ms Ray: ${rayId}`);
             }
         }
+        return response;
     },
 
 
@@ -280,11 +303,14 @@ export default {
             ctx.waitUntil(
                 taskPromise
                 .then(() => {
-                    if (env.LOGGING_ENABLED === "true") console.log(`[ScheduledHandler] END - Successfully completed task for cron '${event.cron}'.`);
+                    if (env.LOGGING_ENABLED === "true") console.log(`[ScheduledHandler] END - Successfully completed task for cron '${event.cron}'. Duration: ${Date.now() - startTime}ms`);
                 })
-                .catch(error => {
+                .catch(error => { // 捕获计划任务执行中的任何错误
                     if (env.LOGGING_ENABLED === "true") console.error(`[ScheduledHandler CRITICAL] Error during scheduled task for cron '${event.cron}':`, error.message, error.stack);
-                    ctx.waitUntil(logErrorToGitHub(env, 'ScheduledTaskExecutionError', error, `Cron: ${event.cron}`));
+                    // 计划任务中的错误通常被认为是服务器端问题
+                    const errorToLog = error instanceof Error ? error : new Error(String(error));
+                    errorToLog.rayId = `scheduled-${event.cron}-${event.scheduledTime}`; // 构造一个唯一的 ID
+                    ctx.waitUntil(logErrorToGitHub(env, 'ScheduledTaskExecutionError', errorToLog, `Cron: ${event.cron}`));
                 })
             );
         }
@@ -627,67 +653,36 @@ async function moveGitHubFile(env, owner, repo, branch, oldPath, newPath, commit
  * @returns {Promise<void>}
  */
 async function logErrorToGitHub(env, errorType, errorObject, additionalContext = 'N/A') {
-    // 功能：将捕获到的严重错误信息格式化并尝试推送到 GitHub 仓库的特定错误日志文件。
-    // 参数：env, errorType, errorObject, additionalContext
-    // 返回：Promise<void>
-    if (env.LOGGING_ENABLED !== "true" && errorType !== 'CRITICAL_ERROR_LOGGING_TO_GITHUB') { // 允许一个特殊标记来强制记录
-        // 通常情况下，如果普通日志关闭，错误日志到 GitHub 也可能关闭，除非特定需要
-        // console.warn("[logErrorToGitHub] LOGGING_ENABLED is false, skipping GitHub error log unless critical.");
-        // return; // 根据策略决定是否在此处返回
+    // 功能：将捕获到的错误信息格式化并尝试推送到 GitHub 仓库的特定错误日志文件。
+    if (!env.GITHUB_PAT) { // 如果没有 PAT，无法推送到 GitHub
+        console.error("[logErrorToGitHub] GITHUB_PAT is not configured. Skipping GitHub error log.");
+        console.error(`[logErrorToGitHub] Original Error (${errorType}) Context: ${additionalContext} Msg: ${errorObject.message}`);
+        return;
     }
-
+    // (其余逻辑和之前一样，格式化错误内容并推送到 GitHub)
     try {
         const timestamp = new Date().toISOString();
-        const errorLogContent = `
-# ${errorType} - ${timestamp}
-
-## Error Message
-\`\`\`
-${errorObject.message || 'No message'}
-\`\`\`
-
-## Stack Trace
-\`\`\`
-${errorObject.stack || 'No stack trace'}
-\`\`\`
-
-## Additional Context
-- Trigger/Request: ${additionalContext}
-- Ray ID (if available from request headers): ${errorObject.rayId || 'N/A'} 
-
-## Environment Snippet (Non-Sensitive)
-- GITHUB_REPO_OWNER: ${env.GITHUB_REPO_OWNER}
-- TARGET_BRANCH: ${env.TARGET_BRANCH}
-- API_VERSION: ${env.API_VERSION || 'v1'}
----
-`;
+        const errorLogContent = `# ${errorType} - ${timestamp}\n\n## Error Message\n\`\`\`\n${errorObject.message || 'No message'}\n\`\`\`\n\n## Stack Trace\n\`\`\`\n${errorObject.stack || 'No stack trace'}\n\`\`\`\n\n## Additional Context\n- Trigger/Request: ${additionalContext}\n- Ray ID: ${errorObject.rayId || request?.headers?.get('cf-ray') || 'N/A'}\n\n## Environment (Non-Sensitive)\n- GITHUB_REPO_OWNER: ${env.GITHUB_REPO_OWNER}\n- TARGET_BRANCH: ${env.TARGET_BRANCH}\n- API_VERSION: ${env.API_VERSION || 'v1'}\n---\n`;
         const errorLogOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
         const errorLogRepo = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
         const errorLogBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
         const errorLogPathPrefix = "system_errors/";
-        const errorFileName = `${timestamp.replace(/:/g, '-').replace(/\..+/, '')}_${errorType.toLowerCase().replace(/\s+/g, '_')}.md`;
+        const errorFileName = `${timestamp.replace(/:/g, '-').replace(/\..+/, '')}_${errorType.toLowerCase().replace(/[^a-z0-9_]/g, '_').substring(0,50)}.md`;
         const errorLogFullPath = `${errorLogPathPrefix}${errorFileName}`;
+        const contentBase64 = arrayBufferToBase64(new TextEncoder().encode(errorLogContent)); // 确保 arrayBufferToBase64 已导入
+        const commitMessage = `Error Log: ${errorType} at ${timestamp.substring(0,19)}`;
 
-        const contentBase64 = arrayBufferToBase64(new TextEncoder().encode(errorLogContent));
-        const commitMessage = `Error Log: ${errorType} at ${timestamp}`;
-
-        console.error(`[CRITICAL ERROR] Attempting to log to GitHub: ${errorLogFullPath}. Error: ${errorObject.message}`);
-
-        // 我们不获取 SHA，总是尝试创建新文件，因为错误文件名包含时间戳，不太可能重复
-        const pushResult = await githubService.createFileOrUpdateFile(
-            env, errorLogOwner, errorLogRepo, errorLogFullPath, errorLogBranch,
-            contentBase64, commitMessage, null
-        );
-
+        console.error(`[logErrorToGitHub] Attempting to log to GitHub: ${errorLogFullPath}. Error: ${errorObject.message}`);
+        // 使用 githubService 模块
+        const pushResult = await githubService.createFileOrUpdateFile(env, errorLogOwner, errorLogRepo, errorLogFullPath, errorLogBranch, contentBase64, commitMessage, null);
         if (pushResult.error) {
-            console.error(`[CRITICAL ERROR] FAILED to push error log to GitHub: ${pushResult.message}`, pushResult.details);
+            console.error(`[logErrorToGitHub] FAILED to push error log to GitHub: ${pushResult.message}`, pushResult.details);
         } else {
-            console.log(`[CRITICAL ERROR] Error log pushed successfully to GitHub: ${errorLogFullPath}`);
+            console.log(`[logErrorToGitHub] Error log pushed successfully to GitHub: ${errorLogFullPath}`);
         }
     } catch (loggingError) {
-        // 如果记录错误到 GitHub 本身也失败了，只能在控制台打印
-        console.error("[CRITICAL ERROR] FAILED to log error to GitHub (secondary error):", loggingError.message, loggingError.stack);
-        console.error("[CRITICAL ERROR] Original error was:", errorObject.message, errorObject.stack);
+        console.error("[logErrorToGitHub] FAILED to log error to GitHub (secondary error):", loggingError.message, loggingError.stack);
+        console.error("[logErrorToGitHub] Original error was:", errorObject.message, errorObject.stack);
     }
 }
 
