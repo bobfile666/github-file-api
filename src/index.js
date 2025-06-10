@@ -16,7 +16,8 @@ import {
     handleAdminGetUserInfo,
     handleAdminDisableUser,
     handleAdminEnableUser,
-    handleAdminDeleteUser
+    handleAdminDeleteUser,
+    handleAdminDashboard
 } from './handlers/admin.js';
 import { 
     arrayBufferToBase64, // 确保从 crypto.js 导入
