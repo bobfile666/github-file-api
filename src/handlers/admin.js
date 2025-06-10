@@ -304,3 +304,170 @@ export async function handleAdminDeleteUser(request, env, ctx, username) {
     }
 }
 
+/**
+ * 新添加的函数：生成并返回管理员操作页面 HTML。
+ * 端点：GET /admin  (或 /v1/admin)
+ * @param {Request} request
+ * @param {object} env
+ * @param {object} ctx
+ * @returns {Promise<Response>}
+ */
+export async function handleAdminDashboard(request, env, ctx) {
+    // 功能：显示一个简单的 HTML 管理面板，包含触发其他管理员操作的表单。
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[handleAdminDashboard] Admin dashboard requested.`);
+    }
+
+    // 简单的密码保护示例 (GET 请求参数或 POST 表单)
+    const url = new URL(request.url);
+    const submittedPassword = url.searchParams.get("password") || (request.method === 'POST' ? (await request.formData()).get("password") : null);
+    const adminPageMessage = url.searchParams.get("message") || ""; // 用于显示操作结果
+
+    if (!env.ADMIN_PAGE_PASSWORD) {
+        if (env.LOGGING_ENABLED === "true") console.error("[handleAdminDashboard] ADMIN_PAGE_PASSWORD secret is not configured.");
+        return new Response("Admin dashboard is misconfigured.", { status: 500, headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    // 如果是 POST 请求，通常是尝试执行一个操作
+    if (request.method === 'POST') {
+        if (!submittedPassword || submittedPassword !== env.ADMIN_PAGE_PASSWORD) {
+            return new Response("Invalid password for action.", { status: 403, headers: { 'Content-Type': 'text/html' } }); // 返回 HTML 提示
+        }
+        const formData = await request.formData();
+        const action = formData.get("action");
+        let actionResult = "";
+
+        if (action === "trigger_status_report") {
+            if (env.LOGGING_ENABLED === "true") console.log("[AdminDashboardAction] Triggering status report generation.");
+            ctx.waitUntil(generateAndPushStatusReport({ cron: "manual_admin_trigger", scheduledTime: Date.now() }, env)); // 调用 index.js 中的函数
+            actionResult = "Status report generation triggered. Check GitHub in a few moments.";
+        } else if (action === "trigger_maintenance_check") {
+            if (env.LOGGING_ENABLED === "true") console.log("[AdminDashboardAction] Triggering maintenance check.");
+            ctx.waitUntil(performMaintenanceChecks({ cron: "manual_admin_trigger", scheduledTime: Date.now() }, env)); // 调用 index.js 中的函数
+            actionResult = "Maintenance check and report generation triggered. Check GitHub in a few moments.";
+        } else if (action === "create_user") {
+            const newUsername = formData.get("new_username");
+            if (newUsername) {
+                // 模拟一个 POST 请求到 handleAdminCreateUser
+                const pseudoRequest = new Request(request.url, { 
+                    method: "POST", 
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-API-Key': env.ADMIN_API_KEY }, // 使用内部的 Admin API Key
+                    body: JSON.stringify({ username: newUsername })
+                });
+                const response = await handleAdminCreateUser(pseudoRequest, env, ctx);
+                const resultJson = await response.json().catch(() => ({}));
+                actionResult = `User creation for '${newUsername}': ${response.status === 201 ? 'Success' : ('Failed - ' + (resultJson.error?.message || response.statusText))}`;
+            } else {
+                actionResult = "Username for creation is missing.";
+            }
+        } else {
+            actionResult = "Unknown action.";
+        }
+        // 重定向回管理页面并带上消息
+        const redirectUrl = new URL(url);
+        redirectUrl.searchParams.set("message", actionResult);
+        redirectUrl.searchParams.delete("password"); // 清除密码参数
+        return Response.redirect(redirectUrl.toString(), 303); // 303 See Other for POST-Redirect-GET
+    }
+
+
+    // 对于 GET 请求，显示登录表单或操作界面
+    let htmlContent = `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Admin Dashboard</title>
+            <style>
+                body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+                .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+                h1, h2 { color: #333; }
+                label { display: block; margin-top: 10px; }
+                input[type="text"], input[type="password"], input[type="submit"], button {
+                    padding: 10px; margin-top: 5px; border-radius: 4px; border: 1px solid #ddd; width: calc(100% - 22px); max-width: 300px;
+                }
+                input[type="submit"], button { background-color: #5cb85c; color: white; cursor: pointer; border: none; }
+                input[type="submit"]:hover, button:hover { background-color: #4cae4c; }
+                .action-group { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; border-radius: 4px;}
+                .message { padding: 10px; background-color: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; border-radius: 4px; margin-bottom:15px; }
+                .error-message { background-color: #f2dede; color: #a94442; border-color: #ebccd1;}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Admin Dashboard</h1>
+    `;
+
+    if (adminPageMessage) {
+        htmlContent += `<p class="message">${escapeHtml(adminPageMessage)}</p>`;
+    }
+
+    if (!submittedPassword || submittedPassword !== env.ADMIN_PAGE_PASSWORD) {
+        htmlContent += `
+            <form method="GET" action="${url.pathname}">
+                <h2>Login</h2>
+                <label for="password">Admin Password:</label>
+                <input type="password" id="password" name="password" required>
+                <input type="submit" value="Login">
+            </form>
+        `;
+    } else {
+        // 已登录，显示操作按钮
+        // 需要将密码通过隐藏字段传递给 POST 操作，或在 POST 时重新输入
+        htmlContent += `
+            <h2>Authenticated Actions</h2>
+            
+            <div class="action-group">
+                <h3>System Reports</h3>
+                <form method="POST" action="${url.pathname}">
+                    <input type="hidden" name="password" value="${escapeHtml(submittedPassword)}">
+                    <input type="hidden" name="action" value="trigger_status_report">
+                    <button type="submit">Generate & Push Status Report Now</button>
+                </form>
+                <br>
+                <form method="POST" action="${url.pathname}">
+                    <input type="hidden" name="password" value="${escapeHtml(submittedPassword)}">
+                    <input type="hidden" name="action" value="trigger_maintenance_check">
+                    <button type="submit">Run Maintenance Checks & Report Now</button>
+                </form>
+            </div>
+
+            <div class="action-group">
+                <h3>User Management</h3>
+                <form method="POST" action="${url.pathname}">
+                    <input type="hidden" name="password" value="${escapeHtml(submittedPassword)}">
+                    <input type="hidden" name="action" value="create_user">
+                    <label for="new_username">New Username:</label>
+                    <input type="text" id="new_username" name="new_username" required placeholder="e.g., newuser_alpha">
+                    <button type="submit">Create User</button>
+                </form>
+                <p><small>Note: More user management features (list, disable, enable, delete) are available via API endpoints listed in <a href="${new URL('/v1/admin/users', url.origin).toString()}?password=${escapeHtml(submittedPassword)}">/v1/admin/users</a> (requires password in URL for direct GET or use Postman with X-Admin-API-Key).</small></p>
+                 <p><a href="${new URL(apiVersionPrefix + '/admin/users', url.origin).toString()}?password=${escapeHtml(submittedPassword)}" target="_blank">View User List (API - JSON)</a></p>
+
+            </div>
+            <hr>
+            <p><a href="${url.pathname}">Logout (Clear Password from URL)</a></p>
+        `;
+    }
+
+    htmlContent += `
+            </div>
+        </body>
+        </html>
+    `;
+
+    return new Response(htmlContent, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+function escapeHtml(unsafe) {
+    // 功能：简单的 HTML 转义函数，防止 XSS。
+    if (typeof unsafe !== 'string') return '';
+    return unsafe
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+}
+
