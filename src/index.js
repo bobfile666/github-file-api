@@ -224,10 +224,9 @@ async function routeRequest(request, env, ctx) {
 export default {
     async fetch(request, env, ctx) {
         // ... (开始的日志和 OPTIONS 处理) ...
+        let response;
         const startTime = Date.now();
-        let response; // 在 try 外部声明，以便 finally 可以访问
         const rayId = request.headers.get('cf-ray') || `fetch-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-
 
         if (env && env.LOGGING_ENABLED === "true") {
             console.log(`[IndexFetch] START: ${request.method} ${request.url} Ray: ${rayId}`);
@@ -236,31 +235,40 @@ export default {
             return handleOptions(request); // 确保 handleOptions 已定义
         }
 
+
         try {
             response = await routeRequest(request, env, ctx); // routeRequest 现在是主要的请求处理器
-        } catch (err) { // 捕获 routeRequest 或其调用的函数中未被捕获的异常
+        } catch (err) { 
             err.rayId = rayId; 
             if (env.LOGGING_ENABLED === "true") {
                 console.error(`[IndexFetch CRITICAL] Unhandled error in routeRequest for ${request.method} ${request.url} (Ray ID: ${rayId}):`, err.message, err.stack, err);
             }
             
-            // 判断是否为服务器错误 (5xx)
-            // 如果 err 对象有 status 属性且是 5xx，或者没有 status 属性（通常是意外 JS 错误），则认为是服务器错误
-            const isServerError = !err.status || (err.status >= 500 && err.status <= 599);
-            if (isServerError) {
+            const isServerError = !err.status || (err.status >= 500 && err.status <= 599) || err.isServerError === true; // 添加对 isServerError 标志的检查
+            const isClientError = err.isClientError === true || (err.status && err.status >= 400 && err.status < 500);
+
+
+            if (isServerError && !isClientError) { // 只记录明确的服务器错误或未标记的5xx错误
                 ctx.waitUntil(logErrorToGitHub(env, 'GlobalFetchError', err, `${request.method} ${request.url}`));
             }
             
-            // 响应给客户端的错误
-            // 如果 err 是一个 Response 对象 (例如从 errorResponse 返回的)，直接返回它
             if (err instanceof Response) {
-                response = err;
+                response = err; // 如果错误本身就是Response对象，直接用它
             } else {
-                // 否则，创建一个新的错误响应
-                // 如果错误对象有 status 和 message，优先使用它们
-                const status = (typeof err.status === 'number' && err.status >= 400 && err.status <= 599) ? err.status : 500;
-                const message = err.message || "An unexpected issue occurred.";
-                response = errorResponse(env, `Internal Server Error. Ray ID: ${rayId}`, status, "GLOBAL_ERROR", {originalError: message});
+                const responseStatus = (typeof err.status === 'number' && err.status >= 400 && err.status <= 599) ? err.status : 500;
+                let responseMessage = "An unexpected error occurred."; // 默认消息
+
+                if (responseStatus >= 500) {
+                    responseMessage = `Internal Server Error. Please contact support if the issue persists. Ray ID: ${rayId}`;
+                } else if (responseStatus === 404) {
+                    responseMessage = err.message || "The requested resource was not found."; // 使用原始错误消息或通用 404 消息
+                } else if (responseStatus === 401 || responseStatus === 403) {
+                    responseMessage = err.message || (responseStatus === 401 ? "Unauthorized." : "Forbidden.");
+                } else if (responseStatus >= 400 && responseStatus < 500) {
+                    responseMessage = err.message || "Bad Request."; // 其他4xx错误的通用消息
+                }
+                
+                response = errorResponse(env, responseMessage, responseStatus, "GLOBAL_ERROR", {originalErrorMessage: err.message});
             }
         } finally {
             if (env && env.LOGGING_ENABLED === "true") {
