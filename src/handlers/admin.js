@@ -305,160 +305,156 @@ export async function handleAdminDeleteUser(request, env, ctx, username) {
 }
 
 /**
- * 新添加的函数：生成并返回管理员操作页面 HTML。
- * 端点：GET /admin  (或 /v1/admin)
+ * 验证请求是否来自合法的管理员 (使用 X-Admin-API-Key Header)。
+ * @param {Request} request
+ * @param {object} env
+ * @returns {boolean}
+ */
+function isAdminApiRequest(request, env) {
+    // 功能：用于 JSON API 的管理员 API 密钥验证。
+    const adminKeyFromHeader = request.headers.get('X-Admin-API-Key');
+    if (!env.ADMIN_API_KEY) {
+        if (env.LOGGING_ENABLED === "true") console.error("[isAdminApiRequest] ADMIN_API_KEY secret is not configured.");
+        return false;
+    }
+    if (!adminKeyFromHeader || adminKeyFromHeader !== env.ADMIN_API_KEY) {
+        if (env.LOGGING_ENABLED === "true") console.warn("[isAdminApiRequest] Admin API Key mismatch or not provided in header.");
+        return false;
+    }
+    return true;
+}
+
+/**
+ * 验证管理员页面密码 (通常来自 URL 参数或 POST 表单)。
+ * @param {string|null} submittedPassword
+ * @param {object} env
+ * @returns {boolean}
+ */
+function verifyAdminPagePassword(submittedPassword, env) {
+    // 功能：用于 HTML 管理页面的密码验证。
+    if (!env.ADMIN_PAGE_PASSWORD) {
+        if (env.LOGGING_ENABLED === "true") console.error("[verifyAdminPagePassword] ADMIN_PAGE_PASSWORD secret is not configured.");
+        return false;
+    }
+    return submittedPassword === env.ADMIN_PAGE_PASSWORD;
+}
+
+/**
+ * 生成并返回管理员操作页面 HTML。
  * @param {Request} request
  * @param {object} env
  * @param {object} ctx
+ * @param {string} apiVersionPrefix - API 版本前缀，例如 "/v1"
  * @returns {Promise<Response>}
  */
-export async function handleAdminDashboard(request, env, ctx) {
-    // 功能：显示一个简单的 HTML 管理面板，包含触发其他管理员操作的表单。
+export async function handleAdminDashboard(request, env, ctx, apiVersionPrefix) {
+    // 功能：显示 HTML 管理面板，包含触发其他管理员操作的表单。
     if (env.LOGGING_ENABLED === "true") {
-        console.log(`[handleAdminDashboard] Admin dashboard requested.`);
+        console.log(`[AdminDashboard] Page requested. Method: ${request.method}`);
     }
 
-    // 简单的密码保护示例 (GET 请求参数或 POST 表单)
     const url = new URL(request.url);
-    const submittedPassword = url.searchParams.get("password") || (request.method === 'POST' ? (await request.formData()).get("password") : null);
-    const adminPageMessage = url.searchParams.get("message") || ""; // 用于显示操作结果
+    // 密码可以来自 GET 参数 (初次访问) 或 POST 表单的隐藏字段
+    let submittedPassword = url.searchParams.get("password");
+    if (request.method === 'POST') {
+        const formData = await request.formData();
+        submittedPassword = formData.get("password") || submittedPassword; // POST 优先
+    }
+    const adminPageMessage = url.searchParams.get("message") || "";
 
     if (!env.ADMIN_PAGE_PASSWORD) {
-        if (env.LOGGING_ENABLED === "true") console.error("[handleAdminDashboard] ADMIN_PAGE_PASSWORD secret is not configured.");
-        return new Response("Admin dashboard is misconfigured.", { status: 500, headers: { 'Content-Type': 'text/plain' } });
+        return new Response("Admin dashboard is misconfigured (password not set).", { status: 500, headers: { 'Content-Type': 'text/plain' } });
     }
 
-    // 如果是 POST 请求，通常是尝试执行一个操作
-    if (request.method === 'POST') {
-        if (!submittedPassword || submittedPassword !== env.ADMIN_PAGE_PASSWORD) {
-            return new Response("Invalid password for action.", { status: 403, headers: { 'Content-Type': 'text/html' } }); // 返回 HTML 提示
-        }
-        const formData = await request.formData();
-        const action = formData.get("action");
-        let actionResult = "";
+    // 如果是 POST 请求，它实际上已经被 index.js 中的特定 action 路由处理了
+    // 这个函数主要负责 GET 请求显示页面，或处理 POST 失败后的 GET 重定向。
+    // 如果将来有直接 POST 到 /admin 的通用操作，可以在这里处理。
+    // 当前模型下，POST 到 /admin/actions/*
 
-        if (action === "trigger_status_report") {
-            if (env.LOGGING_ENABLED === "true") console.log("[AdminDashboardAction] Triggering status report generation.");
-            ctx.waitUntil(generateAndPushStatusReport({ cron: "manual_admin_trigger", scheduledTime: Date.now() }, env)); // 调用 index.js 中的函数
-            actionResult = "Status report generation triggered. Check GitHub in a few moments.";
-        } else if (action === "trigger_maintenance_check") {
-            if (env.LOGGING_ENABLED === "true") console.log("[AdminDashboardAction] Triggering maintenance check.");
-            ctx.waitUntil(performMaintenanceChecks({ cron: "manual_admin_trigger", scheduledTime: Date.now() }, env)); // 调用 index.js 中的函数
-            actionResult = "Maintenance check and report generation triggered. Check GitHub in a few moments.";
-        } else if (action === "create_user") {
-            const newUsername = formData.get("new_username");
-            if (newUsername) {
-                // 模拟一个 POST 请求到 handleAdminCreateUser
-                const pseudoRequest = new Request(request.url, { 
-                    method: "POST", 
-                    headers: { 'Content-Type': 'application/json', 'X-Admin-API-Key': env.ADMIN_API_KEY }, // 使用内部的 Admin API Key
-                    body: JSON.stringify({ username: newUsername })
-                });
-                const response = await handleAdminCreateUser(pseudoRequest, env, ctx);
-                const resultJson = await response.json().catch(() => ({}));
-                actionResult = `User creation for '${newUsername}': ${response.status === 201 ? 'Success' : ('Failed - ' + (resultJson.error?.message || response.statusText))}`;
-            } else {
-                actionResult = "Username for creation is missing.";
-            }
-        } else {
-            actionResult = "Unknown action.";
-        }
-        // 重定向回管理页面并带上消息
-        const redirectUrl = new URL(url);
-        redirectUrl.searchParams.set("message", actionResult);
-        redirectUrl.searchParams.delete("password"); // 清除密码参数
-        return Response.redirect(redirectUrl.toString(), 303); // 303 See Other for POST-Redirect-GET
-    }
-
-
-    // 对于 GET 请求，显示登录表单或操作界面
     let htmlContent = `
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Admin Dashboard</title>
-            <style>
-                body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
-                .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-                h1, h2 { color: #333; }
-                label { display: block; margin-top: 10px; }
-                input[type="text"], input[type="password"], input[type="submit"], button {
-                    padding: 10px; margin-top: 5px; border-radius: 4px; border: 1px solid #ddd; width: calc(100% - 22px); max-width: 300px;
-                }
-                input[type="submit"], button { background-color: #5cb85c; color: white; cursor: pointer; border: none; }
-                input[type="submit"]:hover, button:hover { background-color: #4cae4c; }
-                .action-group { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; border-radius: 4px;}
-                .message { padding: 10px; background-color: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; border-radius: 4px; margin-bottom:15px; }
-                .error-message { background-color: #f2dede; color: #a94442; border-color: #ebccd1;}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Admin Dashboard</h1>
+        <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Admin Dashboard</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; background-color: #f0f2f5; color: #1c1e21; font-size: 14px; }
+            .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1), 0 8px 16px rgba(0,0,0,0.1); max-width: 700px; margin: auto; }
+            h1, h2 { color: #1877f2; } h1 {font-size: 24px;} h2 {font-size: 20px; margin-top:30px; border-bottom: 1px solid #ddd; padding-bottom: 5px;}
+            label { display: block; margin-top: 12px; font-weight: 600; }
+            input[type="text"], input[type="password"], button[type="submit"] {
+                padding: 10px 12px; margin-top: 6px; border-radius: 6px; border: 1px solid #ccd0d5; width: calc(100% - 26px); box-sizing: border-box; font-size:14px;
+            }
+            button[type="submit"] { background-color: #1877f2; color: white; cursor: pointer; border: none; font-weight: 600; }
+            button[type="submit"]:hover { background-color: #166fe5; }
+            .action-group { margin-bottom: 25px; padding: 15px; background-color:#f7f8fa; border: 1px solid #ddd; border-radius: 6px;}
+            .message { padding: 12px; border-radius: 6px; margin-bottom:15px; font-weight: 500;}
+            .success-message { background-color: #e9f5e9; color: #4b844b; border: 1px solid #c8e6c9;}
+            .error-message { background-color: #fdecea; color: #c92a2a; border: 1px solid #f5c6cb;}
+            a { color: #1877f2; text-decoration: none; } a:hover { text-decoration: underline; }
+            hr {border: 0; height: 1px; background-color: #ddd; margin: 20px 0;}
+        </style></head><body><div class="container"><h1>Admin Dashboard</h1>
     `;
 
     if (adminPageMessage) {
-        htmlContent += `<p class="message">${escapeHtml(adminPageMessage)}</p>`;
+        // 根据消息内容简单判断是成功还是错误来应用不同样式 (可以改进)
+        const messageClass = adminPageMessage.toLowerCase().includes("fail") || adminPageMessage.toLowerCase().includes("error") ? "error-message" : "success-message";
+        htmlContent += `<p class="message ${messageClass}">${escapeHtml(adminPageMessage)}</p>`;
     }
 
-    if (!submittedPassword || submittedPassword !== env.ADMIN_PAGE_PASSWORD) {
+    if (!verifyAdminPagePassword(submittedPassword, env)) {
         htmlContent += `
-            <form method="GET" action="${url.pathname}">
-                <h2>Login</h2>
-                <label for="password">Admin Password:</label>
-                <input type="password" id="password" name="password" required>
-                <input type="submit" value="Login">
+            <form method="GET" action="${escapeHtml(url.pathname)}">
+                <h2>Admin Login</h2>
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
+                <button type="submit" style="margin-top:15px; width:auto; padding:10px 20px;">Login</button>
             </form>
         `;
     } else {
         // 已登录，显示操作按钮
-        // 需要将密码通过隐藏字段传递给 POST 操作，或在 POST 时重新输入
+        const authenticatedAdminPath = `${escapeHtml(url.pathname)}?password=${escapeHtml(submittedPassword)}`;
         htmlContent += `
             <h2>Authenticated Actions</h2>
-            
+            <p style="color: green; font-weight: bold;">Authenticated</p>
+
             <div class="action-group">
-                <h3>System Reports</h3>
-                <form method="POST" action="${url.pathname}">
+                <h3>System Reports & Maintenance</h3>
+                <form method="POST" action="${escapeHtml(new URL(apiVersionPrefix + '/admin/actions/trigger-status-report', url.origin).pathname)}">
                     <input type="hidden" name="password" value="${escapeHtml(submittedPassword)}">
-                    <input type="hidden" name="action" value="trigger_status_report">
                     <button type="submit">Generate & Push Status Report Now</button>
                 </form>
                 <br>
-                <form method="POST" action="${url.pathname}">
+                <form method="POST" action="${escapeHtml(new URL(apiVersionPrefix + '/admin/actions/trigger-maintenance-check', url.origin).pathname)}">
                     <input type="hidden" name="password" value="${escapeHtml(submittedPassword)}">
-                    <input type="hidden" name="action" value="trigger_maintenance_check">
                     <button type="submit">Run Maintenance Checks & Report Now</button>
                 </form>
             </div>
 
             <div class="action-group">
-                <h3>User Management</h3>
-                <form method="POST" action="${url.pathname}">
-                    <input type="hidden" name="password" value="${escapeHtml(submittedPassword)}">
-                    <input type="hidden" name="action" value="create_user">
+                <h3>User Management (via Admin Dashboard)</h3>
+                <form method="POST" action="${escapeHtml(new URL(apiVersionPrefix + '/admin/users', url.origin).pathname)}">
+                    <p><small>This form uses the <code>X-Admin-API-Key</code> internally for the create user API.</small></p>
+                    <input type="hidden" name="password_page" value="${escapeHtml(submittedPassword)}"> <!-- Differentiator if needed, or just for re-auth concept -->
                     <label for="new_username">New Username:</label>
-                    <input type="text" id="new_username" name="new_username" required placeholder="e.g., newuser_alpha">
-                    <button type="submit">Create User</button>
+                    <input type="text" id="new_username" name="new_username_dashboard" required placeholder="e.g., newuser_gamma">
+                    <button type="submit">Create User via Dashboard</button>
                 </form>
-                <p><small>Note: More user management features (list, disable, enable, delete) are available via API endpoints listed in <a href="${new URL('/v1/admin/users', url.origin).toString()}?password=${escapeHtml(submittedPassword)}">/v1/admin/users</a> (requires password in URL for direct GET or use Postman with X-Admin-API-Key).</small></p>
-                 <p><a href="${new URL(apiVersionPrefix + '/admin/users', url.origin).toString()}?password=${escapeHtml(submittedPassword)}" target="_blank">View User List (API - JSON)</a></p>
+                <p style="margin-top:15px;">
+                  <a href="${escapeHtml(new URL(apiVersionPrefix + '/admin/users', url.origin).toString())}" 
+                     onclick="this.href+='?password='+document.getElementById('page_password_field_for_links')?.value || prompt('Enter Admin Page Password:'); return !!(document.getElementById('page_password_field_for_links')?.value || true);" 
+                     target="_blank">View User List (API - JSON, requires password or X-Admin-API-Key)</a>
+                </p>
+                 <!-- Hidden field to grab password for links if needed, or prompt -->
+                <input type="hidden" id="page_password_field_for_links" value="${escapeHtml(submittedPassword)}">
 
             </div>
             <hr>
-            <p><a href="${url.pathname}">Logout (Clear Password from URL)</a></p>
+            <p><a href="${escapeHtml(url.pathname)}">Logout (Clear Password from URL & Reload)</a></p>
         `;
     }
 
-    htmlContent += `
-            </div>
-        </body>
-        </html>
-    `;
-
+    htmlContent += `</div></body></html>`;
     return new Response(htmlContent, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
+
 
 function escapeHtml(unsafe) {
     // 功能：简单的 HTML 转义函数，防止 XSS。
@@ -469,5 +465,74 @@ function escapeHtml(unsafe) {
          .replace(/>/g, "&gt;")
          .replace(/"/g, "&quot;")
          .replace(/'/g, "&#039;");
+}
+
+/**
+ * 主路由函数，处理所有 /admin/* 下的请求。
+ * 由 src/index.js 调用。
+ * @param {string} subPath - /admin 之后的部分路径 (e.g., "/users", "/users/testuser", "/dashboard")
+ * @param {Request} request
+ * @param {object} env
+ * @param {object} ctx
+ * @param {string} apiVersionPrefix - e.g., "/v1"
+ * @returns {Promise<Response>}
+ */
+export async function routeAdminRequests(subPath, request, env, ctx, apiVersionPrefix) {
+    // 功能：根据 /admin/ 后的子路径和方法，分发到相应的管理员处理函数。
+    // 参数：subPath, request, env, ctx, apiVersionPrefix
+    // 返回：Promise<Response>
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[routeAdminRequests] Routing admin request for subPath: '${subPath}', Method: ${request.method}`);
+    }
+
+    // HTML Admin Dashboard
+    if ((subPath === '' || subPath === '/' || subPath === '/dashboard') && request.method === 'GET') {
+        return handleAdminDashboard(request, env, ctx, apiVersionPrefix);
+    }
+
+    // Actions triggered by Admin Dashboard (via POST to specific action paths)
+    // These paths are now defined in index.js's routeRequest, so this section might be redundant
+    // if all actions are routed directly from index.js.
+    // However, if admin.js handles its own sub-routing for actions:
+    if (subPath.startsWith('/actions/')) {
+        // Example: /actions/trigger-status-report
+        // These are now better handled directly in index.js's router to simplify password verification logic.
+        // If kept here, they would need isAdminPagePassword or similar check.
+        return errorResponse(env, `Admin action endpoints should be routed from main index.`, 501); // Not Implemented here
+    }
+
+
+    // JSON API for User Management (/users/*)
+    if (subPath.startsWith('/users')) {
+        const userAdminPathRemainder = subPath.substring('/users'.length); // e.g., "", "/username", "/username/disable"
+        const userAdminPathSegments = userAdminPathRemainder.split('/').filter(Boolean);
+
+        // All these JSON APIs should use X-Admin-API-Key
+        if (!isAdminApiRequest(request, env)) {
+            return errorResponse(env, "Unauthorized: Admin API Key required for this operation.", 403);
+        }
+
+        if (userAdminPathSegments.length === 0) { //  /admin/users
+            if (request.method === 'POST') return await handleAdminCreateUser(request, env, ctx);
+            if (request.method === 'GET') return await handleAdminListUsers(request, env, ctx);
+        } else if (userAdminPathSegments.length === 1) { // /admin/users/{username}
+            const usernameParam = userAdminPathSegments[0];
+            if (request.method === 'GET') return await handleAdminGetUserInfo(request, env, ctx, usernameParam);
+            if (request.method === 'DELETE') return await handleAdminDeleteUser(request, env, ctx, usernameParam);
+        } else if (userAdminPathSegments.length === 2) { // /admin/users/{username}/action
+            const usernameParam = userAdminPathSegments[0];
+            const action = userAdminPathSegments[1];
+            if (request.method === 'PUT') { // Or POST depending on preference for actions
+                if (action === 'disable') return await handleAdminDisableUser(request, env, ctx, usernameParam);
+                if (action === 'enable') return await handleAdminEnableUser(request, env, ctx, usernameParam);
+            }
+        }
+    }
+    
+    if (env.LOGGING_ENABLED === "true") {
+        console.warn(`[routeAdminRequests] Admin subPath '${subPath}' not handled for method ${request.method}.`);
+    }
+    return errorResponse(env, `Admin endpoint for '${subPath}' not found or method not supported.`, 404);
 }
 

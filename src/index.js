@@ -11,13 +11,8 @@ import {
     handleFileList 
 } from './handlers/files.js';
 import { 
-    handleAdminCreateUser, 
-    handleAdminListUsers,
-    handleAdminGetUserInfo,
-    handleAdminDisableUser,
-    handleAdminEnableUser,
-    handleAdminDeleteUser,
-    handleAdminDashboard
+    routeAdminRequests, // 主管理员路由器从 admin.js 导入
+    handleAdminCreateUser // 也导入这个，以便 dashboard action 可以调用
 } from './handlers/admin.js';
 import { 
     arrayBufferToBase64, // 确保从 crypto.js 导入
@@ -96,35 +91,39 @@ async function routeRequest(request, env, ctx) {
 
     // --- 管理员路由 (/v1/admin/...) ---
     if (pathname.startsWith(`${apiVersionPrefix}/admin`)) {
-        const adminSubPath = pathname.substring(`${apiVersionPrefix}/admin`.length);
-        const adminPathSegments = adminSubPath.split('/').filter(Boolean);
-
-        // GET /v1/admin (或 /v1/admin/dashboard) - 显示 HTML 仪表盘
+        const adminSubPath = pathname.substring(`${apiVersionPrefix}/admin`.length); // e.g., "", "/dashboard", "/users", "/actions/..."
+        
+        // HTML Admin Dashboard (GET)
         if ((adminSubPath === '' || adminSubPath === '/dashboard') && request.method === 'GET') {
-            return handleAdminDashboard(request, env, ctx);
-        }
-        // POST /v1/admin (或 /v1/admin/dashboard) - 处理仪表盘表单提交
-        if ((adminSubPath === '' || adminSubPath === '/dashboard') && request.method === 'POST') {
-             return handleAdminDashboard(request, env, ctx); // handleAdminDashboard 内部分处理 POST
+            // handleAdminDashboard 现在在 admin.js 中，并且期望 apiVersionPrefix
+            // 我们从 index.js 调用它，所以需要将 apiVersionPrefix 传递过去
+            // 或者 admin.js 中的 handleAdminDashboard 自己从 env.API_VERSION 构建
+            // 为了一致性，我们假设 routeAdminRequests (在 admin.js 中) 会处理这个
+            return await routeAdminRequests(adminSubPath, request, env, ctx, apiVersionPrefix);
         }
 
-        // POST /v1/admin/actions/trigger-status-report
+        // Actions triggered by Admin Dashboard (POST)
         if (adminSubPath === '/actions/trigger-status-report' && request.method === 'POST') {
-            const formData = await request.formData(); // Admin dashboard POSTs form data
+            const formData = await request.formData();
             const password = formData.get("password");
-            if (!env.ADMIN_PAGE_PASSWORD || password !== env.ADMIN_PAGE_PASSWORD) return errorResponse(env, "Invalid password for action.", 403);
+            // 使用 admin.js 中的密码验证辅助函数 (如果已导出并导入)
+            // 或者在这里直接比较：if (!env.ADMIN_PAGE_PASSWORD || password !== env.ADMIN_PAGE_PASSWORD)
+            if (!(env.ADMIN_PAGE_PASSWORD && password === env.ADMIN_PAGE_PASSWORD)) { // 简化版验证
+                 return errorResponse(env, "Invalid password for action.", 403);
+            }
             if (env.LOGGING_ENABLED === "true") console.log("[AdminActionTrigger] Manually triggering status report via HTTP POST.");
             ctx.waitUntil(generateAndPushStatusReport({ cron: "manual_admin_http", scheduledTime: Date.now() }, env));
-            const redirectUrl = new URL(`${apiVersionPrefix}/admin`, url.origin);
+            const redirectUrl = new URL(`${apiVersionPrefix}/admin`, url.origin); // redirect back to dashboard
             redirectUrl.searchParams.set("message", "Status report generation triggered.");
-            redirectUrl.searchParams.set("password", password); // Preserve password for next action
+            redirectUrl.searchParams.set("password", password);
             return Response.redirect(redirectUrl.toString(), 303);
         }
-        // POST /v1/admin/actions/trigger-maintenance-check
         if (adminSubPath === '/actions/trigger-maintenance-check' && request.method === 'POST') {
             const formData = await request.formData();
             const password = formData.get("password");
-            if (!env.ADMIN_PAGE_PASSWORD || password !== env.ADMIN_PAGE_PASSWORD) return errorResponse(env, "Invalid password for action.", 403);
+            if (!(env.ADMIN_PAGE_PASSWORD && password === env.ADMIN_PAGE_PASSWORD)) {
+                 return errorResponse(env, "Invalid password for action.", 403);
+            }
             if (env.LOGGING_ENABLED === "true") console.log("[AdminActionTrigger] Manually triggering maintenance check via HTTP POST.");
             ctx.waitUntil(performMaintenanceChecks({ cron: "manual_admin_http", scheduledTime: Date.now() }, env));
             const redirectUrl = new URL(`${apiVersionPrefix}/admin`, url.origin);
@@ -132,27 +131,44 @@ async function routeRequest(request, env, ctx) {
             redirectUrl.searchParams.set("password", password);
             return Response.redirect(redirectUrl.toString(), 303);
         }
-        
-        // /v1/admin/users... (JSON API, 需要 X-Admin-API-Key)
-        if (adminPathSegments[0] === 'users') {
-            const userAdminPathSegments = adminPathSegments.slice(1);
-            if (userAdminPathSegments.length === 0) { // /admin/users
-                if (request.method === 'POST') return await handleAdminCreateUser(request, env, ctx);
-                if (request.method === 'GET') return await handleAdminListUsers(request, env, ctx);
-            } else if (userAdminPathSegments.length === 1) { // /admin/users/{username}
-                const usernameParam = userAdminPathSegments[0];
-                if (request.method === 'GET') return await handleAdminGetUserInfo(request, env, ctx, usernameParam);
-                if (request.method === 'DELETE') return await handleAdminDeleteUser(request, env, ctx, usernameParam);
-            } else if (userAdminPathSegments.length === 2) { // /admin/users/{username}/action
-                const usernameParam = userAdminPathSegments[0];
-                const action = userAdminPathSegments[1];
-                if (request.method === 'PUT') {
-                    if (action === 'disable') return await handleAdminDisableUser(request, env, ctx, usernameParam);
-                    if (action === 'enable') return await handleAdminEnableUser(request, env, ctx, usernameParam);
-                }
+        // 新增：处理来自 Admin Dashboard 的创建用户 POST 请求
+        if (adminSubPath === '/actions/create-user-from-dashboard' && request.method === 'POST') {
+            const formData = await request.formData();
+            const password = formData.get("password_page"); // 从表单获取页面密码
+            const newUsername = formData.get("new_username_dashboard");
+
+            if (!(env.ADMIN_PAGE_PASSWORD && password === env.ADMIN_PAGE_PASSWORD)) {
+                 return errorResponse(env, "Invalid page password for user creation.", 403);
             }
+            if (!newUsername) {
+                return errorResponse(env, "Username for creation is missing from dashboard form.", 400);
+            }
+            // 模拟一个内部 API 请求给 handleAdminCreateUser (它期望 X-Admin-API-Key)
+            // 或者，更好的做法是重构 handleAdminCreateUser 的核心逻辑到一个不需要 request 对象的函数中
+            // 然后这个路由和 /admin/users POST 路由都调用那个核心逻辑。
+            // 为了当前能工作，我们暂时让这个路由直接调用 handleAdminCreateUser，并伪造一个带有 X-Admin-API-Key 的请求。
+            // 这不是最佳实践，但能让页面表单工作。
+            const pseudoRequestForCreateUser = new Request(url.toString(), { // 使用当前 URL，但主要是为了 headers 和 body
+                method: "POST",
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'X-Admin-API-Key': env.ADMIN_API_KEY // 使用真实的 Admin API Key
+                },
+                body: JSON.stringify({ username: newUsername })
+            });
+            const createUserResponse = await handleAdminCreateUser(pseudoRequestForCreateUser, env, ctx); // 调用 admin.js 中的函数
+            const resultJson = await createUserResponse.json().catch(() => ({}));
+            const actionResult = `Dashboard User Creation for '${newUsername}': ${createUserResponse.status === 201 ? 'Success' : ('Failed - ' + (resultJson.error?.message || createUserResponse.statusText))}`;
+            
+            const redirectUrl = new URL(`${apiVersionPrefix}/admin`, url.origin);
+            redirectUrl.searchParams.set("message", actionResult);
+            redirectUrl.searchParams.set("password", password); // 保留页面密码
+            return Response.redirect(redirectUrl.toString(), 303);
         }
-        return errorResponse(env, `Admin endpoint ${pathname} not found or method ${request.method} not supported.`, 404);
+        
+        // 其他 /admin/* 请求 (主要是 /admin/users/* JSON API)
+        // 将这些请求传递给 admin.js 中的 routeAdminRequests
+        return await routeAdminRequests(adminSubPath, request, env, ctx, apiVersionPrefix);
     }
 
     // --- 认证端点 (/v1/auth/...) ---
