@@ -306,22 +306,31 @@ async function getUserIndexForScheduledTask(env, username) {
 
 /**
  * 生成并推送系统状态报告。
- * @param {ScheduledEvent} event
- * @param {object} env
+ * (此函数包含用户统计、近期活动等报告内容生成，以及将报告归档和推送到 GitHub 的逻辑)
+ * @param {ScheduledEvent | { cron: string, scheduledTime: number }} event - 调度事件或模拟事件
+ * @param {object} env - Worker 环境变量
  * @returns {Promise<void>}
  */
 async function generateAndPushStatusReport(event, env) {
-    // 功能：生成关于用户统计和近期活动的报告，并推送到 GitHub。
+    // 功能：生成关于用户统计和近期活动的报告，归档旧报告，并推送到 GitHub。
+    // (此函数的完整代码已在之前的回答中提供，包含报告内容生成和 GitHub 推送逻辑)
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[StatusReportTask] Starting - Triggered by: ${event.cron}`);
     }
-    let reportContent = `# System Status Report - ${new Date(event.scheduledTime).toISOString()}\n\n`;
+    const reportTimestampDate = new Date(event.scheduledTime);
+    const reportTimestampISO = reportTimestampDate.toISOString();
+    let reportContent = `# System Status Report - ${reportTimestampISO}\n\nCron: ${event.cron}\n\n`;
 
     // --- 用户统计 ---
     if (env.DB) {
-        const countStmt = env.DB.prepare("SELECT COUNT(*) as total_users FROM Users WHERE status = 'active'");
-        const countResult = await countStmt.first();
-        reportContent += `## User Statistics\n- Active Users: ${countResult ? countResult.total_users : 0}\n\n`;
+        try {
+            const countStmt = env.DB.prepare("SELECT COUNT(*) as total_users FROM Users WHERE status = 'active'");
+            const countResult = await countStmt.first();
+            reportContent += `## User Statistics\n- Active Users: ${countResult ? countResult.total_users : 0}\n\n`;
+        } catch (dbError) {
+            reportContent += `## User Statistics\n- Error fetching user statistics: ${dbError.message}\n\n`;
+            if (env.LOGGING_ENABLED === "true") console.error("[StatusReportTask] D1 Error fetching user count:", dbError);
+        }
     } else {
         reportContent += `- User statistics unavailable (D1 DB not configured).\n\n`;
     }
@@ -330,180 +339,201 @@ async function generateAndPushStatusReport(event, env) {
     if (env.DB) {
         reportContent += `## Recent Activity Summary (Last 24 Hours)\n`;
         const activityTimeLimit = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        
-        // 1. 按用户和操作类型统计成功次数
-        const successActivityStmt = env.DB.prepare(
-            "SELECT user_id, action_type, COUNT(*) as success_count, SUM(CASE WHEN action_type = 'upload' THEN file_size_bytes ELSE 0 END) as total_upload_size " +
-            "FROM FileActivityLogs " +
-            "WHERE logged_at >= ? AND status = 'success' " +
-            "GROUP BY user_id, action_type " +
-            "ORDER BY success_count DESC, total_upload_size DESC LIMIT 15"
-        );
-        const { results: successActivities } = await successActivityStmt.bind(activityTimeLimit).all();
+        try {
+            // 成功活动
+            const successActivityStmt = env.DB.prepare(
+                "SELECT user_id, action_type, COUNT(*) as success_count, SUM(CASE WHEN action_type = 'upload' THEN file_size_bytes ELSE 0 END) as total_upload_size " +
+                "FROM FileActivityLogs WHERE logged_at >= ? AND status = 'success' GROUP BY user_id, action_type ORDER BY success_count DESC, total_upload_size DESC LIMIT 15"
+            );
+            const { results: successActivities } = await successActivityStmt.bind(activityTimeLimit).all();
+            if (successActivities && successActivities.length > 0) {
+                reportContent += `### Top Successful Activities:\n| User ID        | Action   | Success Count | Total Upload Size (Bytes) |\n|----------------|----------|---------------|---------------------------|\n`;
+                successActivities.forEach(act => {
+                    reportContent += `| ${act.user_id.padEnd(14)} | ${act.action_type.padEnd(8)} | ${String(act.success_count).padEnd(13)} | ${act.action_type === 'upload' ? String(act.total_upload_size || 0).padEnd(25) : 'N/A'.padEnd(25)} |\n`;
+                });
+            } else { reportContent += `- No successful activities recorded in the last 24 hours.\n`; }
+            reportContent += `\n`;
 
-        if (successActivities && successActivities.length > 0) {
-            reportContent += `### Top Successful Activities:\n`;
-            reportContent += `| User ID        | Action   | Success Count | Total Upload Size (Bytes) |\n`;
-            reportContent += `|----------------|----------|---------------|---------------------------|\n`;
-            for (const activity of successActivities) {
-                reportContent += `| ${activity.user_id.padEnd(14)} | ${activity.action_type.padEnd(8)} | ${String(activity.success_count).padEnd(13)} | ${activity.action_type === 'upload' ? String(activity.total_upload_size || 0).padEnd(25) : 'N/A'.padEnd(25)} |\n`;
-            }
-        } else {
-            reportContent += `- No successful activities recorded in the last 24 hours.\n`;
+            // 失败活动
+            const failureActivityStmt = env.DB.prepare(
+                "SELECT user_id, action_type, COUNT(*) as failure_count, GROUP_CONCAT(DISTINCT SUBSTR(error_message, 1, 30)) as common_errors " +
+                "FROM FileActivityLogs WHERE logged_at >= ? AND status = 'failure' GROUP BY user_id, action_type ORDER BY failure_count DESC LIMIT 10"
+            );
+            const { results: failureActivities } = await failureActivityStmt.bind(activityTimeLimit).all();
+            if (failureActivities && failureActivities.length > 0) {
+                reportContent += `### Top Failed Activities:\n| User ID        | Action   | Failure Count | Common Errors (truncated)    |\n|----------------|----------|---------------|------------------------------|\n`;
+                failureActivities.forEach(act => {
+                    reportContent += `| ${act.user_id.padEnd(14)} | ${act.action_type.padEnd(8)} | ${String(act.failure_count).padEnd(13)} | ${(act.common_errors || 'N/A').padEnd(28)} |\n`;
+                });
+            } else { reportContent += `- No failed activities recorded in the last 24 hours.\n`; }
+            reportContent += `\n`;
+
+        } catch (dbError) {
+            reportContent += `- Error fetching recent activity: ${dbError.message}\n\n`;
+            if (env.LOGGING_ENABLED === "true") console.error("[StatusReportTask] D1 Error fetching activity logs:", dbError);
         }
-        reportContent += `\n`;
-
-        // 2. 按用户和操作类型统计失败次数
-        const failureActivityStmt = env.DB.prepare(
-            "SELECT user_id, action_type, COUNT(*) as failure_count, GROUP_CONCAT(DISTINCT SUBSTR(error_message, 1, 30)) as common_errors " + // 显示常见的错误信息（截断）
-            "FROM FileActivityLogs " +
-            "WHERE logged_at >= ? AND status = 'failure' " +
-            "GROUP BY user_id, action_type " +
-            "ORDER BY failure_count DESC LIMIT 10"
-        );
-        const { results: failureActivities } = await failureActivityStmt.bind(activityTimeLimit).all();
-
-        if (failureActivities && failureActivities.length > 0) {
-            reportContent += `### Top Failed Activities:\n`;
-            reportContent += `| User ID        | Action   | Failure Count | Common Errors (truncated)    |\n`;
-            reportContent += `|----------------|----------|---------------|------------------------------|\n`;
-            for (const activity of failureActivities) {
-                reportContent += `| ${activity.user_id.padEnd(14)} | ${activity.action_type.padEnd(8)} | ${String(activity.failure_count).padEnd(13)} | ${(activity.common_errors || 'N/A').padEnd(28)} |\n`;
-            }
-        } else {
-            reportContent += `- No failed activities recorded in the last 24 hours.\n`;
-        }
-        reportContent += `\n`;
-
-        // 3. 最近的几条详细日志 (示例)
-        reportContent += `### Latest Activity Details (Sample - Max 10):\n`;
-        const latestDetailsStmt = env.DB.prepare(
-            "SELECT logged_at, user_id, action_type, SUBSTR(original_file_path, 1, 40) as path_preview, status, SUBSTR(error_message, 1, 30) as error_preview " +
-            "FROM FileActivityLogs " +
-            "WHERE logged_at >= ? " +
-            "ORDER BY logged_at DESC LIMIT 10"
-        );
-        const { results: latestDetails } = await latestDetailsStmt.bind(activityTimeLimit).all();
-        if (latestDetails && latestDetails.length > 0) {
-            reportContent += `| Timestamp (UTC)       | User ID        | Action   | Path Preview (40 chars)      | Status  | Error Preview (30 chars) |\n`;
-            reportContent += `|-----------------------|----------------|----------|------------------------------|---------|--------------------------|\n`;
-            for (const detail of latestDetails) {
-                const ts = detail.logged_at.replace('T', ' ').substring(0, 19);
-                reportContent += `| ${ts.padEnd(21)} | ${detail.user_id.padEnd(14)} | ${detail.action_type.padEnd(8)} | ${(detail.path_preview || '').padEnd(28)} | ${detail.status.padEnd(7)} | ${(detail.error_preview || 'N/A').padEnd(24)} |\n`;
-            }
-        } else {
-            reportContent += `- No detailed activity entries in the last 24 hours.\n`;
-        }
-        reportContent += `\n`;
-
-
     } else {
          reportContent += `- Recent activity unavailable (D1 DB not configured).\n\n`;
     }
     
-    // ... (报告推送逻辑和之前一样) ...
+    // --- 报告文件路径配置 ---
     const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
     const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
     const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
-    const reportPathPrefix = env.STATUS_REPORT_PATH_PREFIX || "system_reports/status/";
-    
-    const reportTimestamp = new Date(event.scheduledTime).toISOString().replace(/:/g, '-').replace(/\..+/, '');
-    const reportFileName = `${reportTimestamp}_status_report.md`;
-    const reportFullPath = `${reportPathPrefix.endsWith('/') ? reportPathPrefix : reportPathPrefix + '/'}${reportFileName}`;
-    
-    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent)); // 确保 arrayBufferToBase64 从 crypto.js 导入
-    const commitMessage = `System Status Report: ${reportTimestamp}`;
+    const baseReportDir = env.STATUS_REPORT_PATH_PREFIX || "system_reports/status/";
+    const latestReportRelativePath = "latest_status_report.md";
+    const latestReportFullPath = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}${latestReportRelativePath}`;
 
-    if (env.LOGGING_ENABLED === "true") {
-        console.log(`[StatusReportTask] Attempting to push status report to: ${reportRepoOwner}/${reportRepoName} - ${reportFullPath}`);
+    // --- 1. 归档上一份 "最新" 报告 ---
+    const previousReportData = await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch);
+    if (previousReportData && previousReportData.sha) {
+        const archiveDate = new Date(reportTimestampDate.getTime() - (119 * 60 * 1000)); // 近似上次报告时间 (1 小时 59 分钟前)
+        const archiveYear = archiveDate.getUTCFullYear();
+        const archiveMonth = (archiveDate.getUTCMonth() + 1).toString().padStart(2, '0');
+        const archiveDay = archiveDate.getUTCDate().toString().padStart(2, '0');
+        const archiveHour = archiveDate.getUTCHours().toString().padStart(2, '0');
+        const archiveMinute = archiveDate.getUTCMinutes().toString().padStart(2, '0');
+        
+        const archiveDir = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}archive/${archiveYear}/${archiveMonth}/${archiveDay}/`;
+        const archivedReportFileName = `${archiveYear}-${archiveMonth}-${archiveDay}T${archiveHour}-${archiveMinute}_status_report.md`;
+        const archivedReportFullPath = `${archiveDir}${archivedReportFileName}`;
+
+        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Archiving previous report from '${latestReportFullPath}' to '${archivedReportFullPath}'`);
+        const moved = await moveGitHubFile(env, reportRepoOwner, reportRepoName, reportRepoBranch, latestReportFullPath, archivedReportFullPath, "Chore: Archive status report");
+        if (!moved && env.LOGGING_ENABLED === "true") console.warn(`[StatusReportTask] Failed to archive previous status report. New report might overwrite or create alongside.`);
+    } else if (env.LOGGING_ENABLED === "true") {
+        console.log(`[StatusReportTask] No previous '${latestReportRelativePath}' found to archive at ${latestReportFullPath}.`);
     }
 
-    const existingReportSha = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, reportFullPath, reportRepoBranch))?.sha;
-    const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, reportFullPath, reportRepoBranch, reportContentBase64, commitMessage, existingReportSha);
+    // --- 2. 将新报告写入 "最新" 报告路径 ---
+    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent)); // Ensure arrayBufferToBase64 is imported
+    const commitMessage = `System Status Report: ${reportTimestampISO}`;
+    const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha;
+
+    if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Pushing new status report to '${latestReportFullPath}'`);
+    const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch, reportContentBase64, commitMessage, latestReportShaAfterArchiveAttempt);
 
     if (pushResult.error) {
-        console.error(`[StatusReportTask] Failed to push status report: ${pushResult.message}`, pushResult.details ? JSON.stringify(pushResult.details).substring(0,500) : '');
+        console.error(`[StatusReportTask] Failed to push new status report: ${pushResult.message}`, pushResult.details ? JSON.stringify(pushResult.details).substring(0,500) : '');
+        // 如果推送到 GitHub 失败，尝试用 logErrorToGitHub 记录这个错误（它本身也会尝试推送到 GitHub 的不同路径）
+        await logErrorToGitHub(env, 'StatusReportPushError', new Error(pushResult.message), `Report Path: ${latestReportFullPath}, Details: ${JSON.stringify(pushResult.details)}`);
     } else {
-        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Status report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
+        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] New status report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
     }
 }
+
 
 
 /**
  * 执行数据维护和一致性检查，并生成报告。
- * @param {ScheduledEvent} event
+ * (此函数包含检查用户索引文件、索引条目有效性等，以及归档和推送报告)
+ * @param {ScheduledEvent | { cron: string, scheduledTime: number }} event
  * @param {object} env
  * @returns {Promise<void>}
  */
 async function performMaintenanceChecks(event, env) {
-    // 功能：检查数据一致性 (例如，索引与物理文件)，并生成维护报告。
-    // 参数：event, env
-    // 返回：Promise<void>
+    // 功能：执行维护检查，归档旧报告，并生成和推送新报告。
+    // (此函数的完整代码已在之前的回答中提供)
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[MaintenanceTask] Starting - Triggered by: ${event.cron}`);
     }
-    let reportContent = `# Data Maintenance & Consistency Report - ${new Date(event.scheduledTime).toISOString()}\n\n`;
-    let issuesFound = 0;
+    const reportTimestampDate = new Date(event.scheduledTime);
+    const reportTimestampISO = reportTimestampDate.toISOString();
+    let reportContent = `# Data Maintenance & Consistency Report - ${reportTimestampISO}\n\nCron: ${event.cron}\n\n`;
+    let issuesFoundDetails = [];
 
-    // 这是一个非常复杂的操作，需要小心设计以避免性能问题和 API 限流
-    // 简化版：仅报告有多少用户的索引文件存在
-    reportContent += `## Index File Existence Check (Simplified)\n`;
+    // --- 1. 检查用户索引文件是否存在 ---
+    reportContent += `## Phase 1: User Index File Existence Check\n`;
     if (env.DB) {
-        const usersStmt = env.DB.prepare("SELECT user_id FROM Users WHERE status = 'active'");
-        const { results: activeUsers } = await usersStmt.all();
-        if (activeUsers && activeUsers.length > 0) {
-            reportContent += `Checking index files for ${activeUsers.length} active users...\n`;
-            for (const user of activeUsers) {
-                const indexPath = `${user.user_id}/index.json`;
-                const indexFileMeta = await githubService.getFileShaFromPath(
-                    env, 
-                    env.GITHUB_REPO_OWNER, 
-                    env.GITHUB_REPO_NAME, 
-                    indexPath, 
-                    env.TARGET_BRANCH || "main"
-                );
-                if (!indexFileMeta) {
-                    reportContent += `- **ISSUE**: User '${user.user_id}' - index.json NOT FOUND at '${indexPath}'.\n`;
-                    issuesFound++;
-                } else {
-                    // reportContent += `- User '${user.user_id}' - index.json found.\n`; // 可选，如果用户很多会使报告冗长
+        try {
+            const usersStmt = env.DB.prepare("SELECT user_id FROM Users WHERE status = 'active'");
+            const { results: activeUsers } = await usersStmt.all();
+            if (activeUsers && activeUsers.length > 0) {
+                reportContent += `Checking index files for ${activeUsers.length} active users...\n`;
+                for (const user of activeUsers) {
+                    const indexPath = `${user.user_id}/index.json`;
+                    const indexFileMeta = await githubService.getFileShaFromPath(env, env.GITHUB_REPO_OWNER, env.GITHUB_REPO_NAME, indexPath, env.TARGET_BRANCH || "main");
+                    if (!indexFileMeta) {
+                        const issue = `User '${user.user_id}': index.json NOT FOUND at '${indexPath}'.`;
+                        reportContent += `- **ISSUE**: ${issue}\n`;
+                        issuesFoundDetails.push({ type: "MissingIndexFile", user: user.user_id, path: indexPath, details: issue });
+                    } else {
+                        const { indexData } = await getUserIndexForScheduledTask(env, user.user_id); // 确保此函数可用
+                        if (indexData && indexData.files) {
+                            for (const originalPath in indexData.files) {
+                                const fileHash = indexData.files[originalPath];
+                                const hashedFilePath = `${user.user_id}/${fileHash}`;
+                                const physicalFileMeta = await githubService.getFileShaFromPath(env, env.GITHUB_REPO_OWNER, env.GITHUB_REPO_NAME, hashedFilePath, env.TARGET_BRANCH || "main");
+                                if (!physicalFileMeta) {
+                                    const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) points to non-existent physical file '${hashedFilePath}'.`;
+                                    reportContent += `- **ISSUE**: ${issue}\n`;
+                                    issuesFoundDetails.push({ type: "BrokenIndexLink", user: user.user_id, originalPath, fileHash, physicalPath: hashedFilePath, details: issue });
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-            if (issuesFound === 0) {
-                reportContent += `- All checked active users have an index.json file.\n`;
-            } else {
-                reportContent += `\n**Total issues found: ${issuesFound}**\n`;
-            }
-        } else {
-            reportContent += `- No active users to check.\n`;
+                if (issuesFoundDetails.length === 0) {
+                    reportContent += `- All checked active users have an index.json file and basic index links seem valid.\n`;
+                } else {
+                    reportContent += `\n**Total primary issues found: ${issuesFoundDetails.length} (see details below)**\n`;
+                }
+            } else { reportContent += `- No active users to check.\n`; }
+        } catch (dbError) {
+            reportContent += `- Error during maintenance checks (DB query): ${dbError.message}\n\n`;
+            if (env.LOGGING_ENABLED === "true") console.error("[MaintenanceTask] D1 Error during user query:", dbError);
         }
-    } else {
-        reportContent += `- Maintenance checks requiring D1 (Users table) skipped.\n`;
+    } else { reportContent += `- Maintenance checks requiring D1 (Users table) skipped.\n`; }
+    reportContent += `\n`;
+
+    // ... (可选的孤立文件检查描述) ...
+
+    if (issuesFoundDetails.length > 0) {
+        reportContent += `## Detailed Issues Found:\n`;
+        issuesFoundDetails.forEach(issue => { /* ... 格式化 issue ... */ 
+             reportContent += `### Type: ${issue.type}\n- User: ${issue.user}\n`;
+             if(issue.path) reportContent += `- Path: \`${issue.path}\`\n`;
+             if(issue.originalPath) reportContent += `- Original Path: \`${issue.originalPath}\`\n`;
+             if(issue.fileHash) reportContent += `- Hash: \`${issue.fileHash}\`\n`;
+             if(issue.physicalPath) reportContent += `- Physical Path: \`${issue.physicalPath}\`\n`;
+             reportContent += `- Details: ${issue.details}\n\n`;
+        });
     }
-    reportContent += `\n**Note**: Full consistency checks (orphaned files, broken index links) are complex and not fully implemented in this report.\n`;
-    
-    // 推送报告
+    // ... (报告归档和推送逻辑，使用 MAINTENANCE_REPORT_PATH_PREFIX) ...
     const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
     const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
     const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
-    const reportPathPrefix = env.MAINTENANCE_REPORT_PATH_PREFIX || "system_reports/maintenance/"; // 使用不同的前缀
+    const baseReportDir = env.MAINTENANCE_REPORT_PATH_PREFIX || "system_reports/maintenance/";
+    const latestReportRelativePath = "latest_maintenance_report.md";
+    const latestReportFullPath = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}${latestReportRelativePath}`;
 
-    const reportTimestamp = new Date(event.scheduledTime).toISOString().replace(/:/g, '-').replace(/\..+/, '');
-    const reportFileName = `${reportTimestamp}_maintenance_report.md`;
-    const reportFullPath = `${reportPathPrefix.endsWith('/') ? reportPathPrefix : reportPathPrefix + '/'}${reportFileName}`;
-    
+    // 归档
+    const previousReportData = await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch);
+    if (previousReportData && previousReportData.sha) {
+        const archiveDate = new Date(reportTimestampDate.getTime() - (23 * 60 * 60 * 1000 + 59 * 60 * 1000) ); // 23h 59m ago
+        const archiveYear = archiveDate.getUTCFullYear();
+        const archiveMonth = (archiveDate.getUTCMonth() + 1).toString().padStart(2, '0');
+        const archiveDay = archiveDate.getUTCDate().toString().padStart(2, '0');
+        const archiveDir = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}archive/${archiveYear}/${archiveMonth}/${archiveDay}/`;
+        const archivedReportFileName = `${archiveDate.toISOString().replace(/:/g, '-').replace(/\..+/, '')}_maintenance_report.md`;
+        const archivedReportFullPath = `${archiveDir}${archivedReportFileName}`;
+        await moveGitHubFile(env, reportRepoOwner, reportRepoName, reportRepoBranch, latestReportFullPath, archivedReportFullPath, "Chore: Archive maintenance report");
+    }
+
+    // 推送新报告
     const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent));
-    const commitMessage = `System Maintenance Report: ${reportTimestamp}`;
-
-    const existingReportSha = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, reportFullPath, reportRepoBranch))?.sha;
-    const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, reportFullPath, reportRepoBranch, reportContentBase64, commitMessage, existingReportSha);
+    const commitMessage = `System Maintenance Report: ${reportTimestampISO}`;
+    const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha;
+    const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch, reportContentBase64, commitMessage, latestReportShaAfterArchiveAttempt);
 
     if (pushResult.error) {
-        console.error(`[MaintenanceTask] Failed to push maintenance report: ${pushResult.message}`, pushResult.details);
+        console.error(`[MaintenanceTask] Failed to push new maintenance report: ${pushResult.message}`, pushResult.details);
+        await logErrorToGitHub(env, 'MaintenanceReportPushError', new Error(pushResult.message), `Report Path: ${latestReportFullPath}, Details: ${JSON.stringify(pushResult.details)}`);
     } else {
-        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] Maintenance report pushed. Commit: ${pushResult.commit?.sha || 'N/A'}`);
+        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] New maintenance report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
     }
 }
+
 
 /**
  * 辅助函数：将 GitHub 上的文件移动/重命名 (通过复制和删除实现)
@@ -644,233 +674,6 @@ ${errorObject.stack || 'No stack trace'}
     }
 }
 
-/**
- * 生成并推送系统状态报告。
- * (此函数包含用户统计、近期活动等报告内容生成，以及将报告归档和推送到 GitHub 的逻辑)
- * @param {ScheduledEvent | { cron: string, scheduledTime: number }} event - 调度事件或模拟事件
- * @param {object} env - Worker 环境变量
- * @returns {Promise<void>}
- */
-async function generateAndPushStatusReport(event, env) {
-    // 功能：生成关于用户统计和近期活动的报告，归档旧报告，并推送到 GitHub。
-    // (此函数的完整代码已在之前的回答中提供，包含报告内容生成和 GitHub 推送逻辑)
-    if (env.LOGGING_ENABLED === "true") {
-        console.log(`[StatusReportTask] Starting - Triggered by: ${event.cron}`);
-    }
-    const reportTimestampDate = new Date(event.scheduledTime);
-    const reportTimestampISO = reportTimestampDate.toISOString();
-    let reportContent = `# System Status Report - ${reportTimestampISO}\n\nCron: ${event.cron}\n\n`;
-
-    // --- 用户统计 ---
-    if (env.DB) {
-        try {
-            const countStmt = env.DB.prepare("SELECT COUNT(*) as total_users FROM Users WHERE status = 'active'");
-            const countResult = await countStmt.first();
-            reportContent += `## User Statistics\n- Active Users: ${countResult ? countResult.total_users : 0}\n\n`;
-        } catch (dbError) {
-            reportContent += `## User Statistics\n- Error fetching user statistics: ${dbError.message}\n\n`;
-            if (env.LOGGING_ENABLED === "true") console.error("[StatusReportTask] D1 Error fetching user count:", dbError);
-        }
-    } else {
-        reportContent += `- User statistics unavailable (D1 DB not configured).\n\n`;
-    }
-
-    // --- 近期活动 (例如过去 24 小时) ---
-    if (env.DB) {
-        reportContent += `## Recent Activity Summary (Last 24 Hours)\n`;
-        const activityTimeLimit = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        try {
-            // 成功活动
-            const successActivityStmt = env.DB.prepare(
-                "SELECT user_id, action_type, COUNT(*) as success_count, SUM(CASE WHEN action_type = 'upload' THEN file_size_bytes ELSE 0 END) as total_upload_size " +
-                "FROM FileActivityLogs WHERE logged_at >= ? AND status = 'success' GROUP BY user_id, action_type ORDER BY success_count DESC, total_upload_size DESC LIMIT 15"
-            );
-            const { results: successActivities } = await successActivityStmt.bind(activityTimeLimit).all();
-            if (successActivities && successActivities.length > 0) {
-                reportContent += `### Top Successful Activities:\n| User ID        | Action   | Success Count | Total Upload Size (Bytes) |\n|----------------|----------|---------------|---------------------------|\n`;
-                successActivities.forEach(act => {
-                    reportContent += `| ${act.user_id.padEnd(14)} | ${act.action_type.padEnd(8)} | ${String(act.success_count).padEnd(13)} | ${act.action_type === 'upload' ? String(act.total_upload_size || 0).padEnd(25) : 'N/A'.padEnd(25)} |\n`;
-                });
-            } else { reportContent += `- No successful activities recorded in the last 24 hours.\n`; }
-            reportContent += `\n`;
-
-            // 失败活动
-            const failureActivityStmt = env.DB.prepare(
-                "SELECT user_id, action_type, COUNT(*) as failure_count, GROUP_CONCAT(DISTINCT SUBSTR(error_message, 1, 30)) as common_errors " +
-                "FROM FileActivityLogs WHERE logged_at >= ? AND status = 'failure' GROUP BY user_id, action_type ORDER BY failure_count DESC LIMIT 10"
-            );
-            const { results: failureActivities } = await failureActivityStmt.bind(activityTimeLimit).all();
-            if (failureActivities && failureActivities.length > 0) {
-                reportContent += `### Top Failed Activities:\n| User ID        | Action   | Failure Count | Common Errors (truncated)    |\n|----------------|----------|---------------|------------------------------|\n`;
-                failureActivities.forEach(act => {
-                    reportContent += `| ${act.user_id.padEnd(14)} | ${act.action_type.padEnd(8)} | ${String(act.failure_count).padEnd(13)} | ${(act.common_errors || 'N/A').padEnd(28)} |\n`;
-                });
-            } else { reportContent += `- No failed activities recorded in the last 24 hours.\n`; }
-            reportContent += `\n`;
-
-        } catch (dbError) {
-            reportContent += `- Error fetching recent activity: ${dbError.message}\n\n`;
-            if (env.LOGGING_ENABLED === "true") console.error("[StatusReportTask] D1 Error fetching activity logs:", dbError);
-        }
-    } else {
-         reportContent += `- Recent activity unavailable (D1 DB not configured).\n\n`;
-    }
-    
-    // --- 报告文件路径配置 ---
-    const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
-    const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
-    const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
-    const baseReportDir = env.STATUS_REPORT_PATH_PREFIX || "system_reports/status/";
-    const latestReportRelativePath = "latest_status_report.md";
-    const latestReportFullPath = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}${latestReportRelativePath}`;
-
-    // --- 1. 归档上一份 "最新" 报告 ---
-    const previousReportData = await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch);
-    if (previousReportData && previousReportData.sha) {
-        const archiveDate = new Date(reportTimestampDate.getTime() - (119 * 60 * 1000)); // 近似上次报告时间 (1 小时 59 分钟前)
-        const archiveYear = archiveDate.getUTCFullYear();
-        const archiveMonth = (archiveDate.getUTCMonth() + 1).toString().padStart(2, '0');
-        const archiveDay = archiveDate.getUTCDate().toString().padStart(2, '0');
-        const archiveHour = archiveDate.getUTCHours().toString().padStart(2, '0');
-        const archiveMinute = archiveDate.getUTCMinutes().toString().padStart(2, '0');
-        
-        const archiveDir = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}archive/${archiveYear}/${archiveMonth}/${archiveDay}/`;
-        const archivedReportFileName = `${archiveYear}-${archiveMonth}-${archiveDay}T${archiveHour}-${archiveMinute}_status_report.md`;
-        const archivedReportFullPath = `${archiveDir}${archivedReportFileName}`;
-
-        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Archiving previous report from '${latestReportFullPath}' to '${archivedReportFullPath}'`);
-        const moved = await moveGitHubFile(env, reportRepoOwner, reportRepoName, reportRepoBranch, latestReportFullPath, archivedReportFullPath, "Chore: Archive status report");
-        if (!moved && env.LOGGING_ENABLED === "true") console.warn(`[StatusReportTask] Failed to archive previous status report. New report might overwrite or create alongside.`);
-    } else if (env.LOGGING_ENABLED === "true") {
-        console.log(`[StatusReportTask] No previous '${latestReportRelativePath}' found to archive at ${latestReportFullPath}.`);
-    }
-
-    // --- 2. 将新报告写入 "最新" 报告路径 ---
-    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent)); // Ensure arrayBufferToBase64 is imported
-    const commitMessage = `System Status Report: ${reportTimestampISO}`;
-    const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha;
-
-    if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] Pushing new status report to '${latestReportFullPath}'`);
-    const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch, reportContentBase64, commitMessage, latestReportShaAfterArchiveAttempt);
-
-    if (pushResult.error) {
-        console.error(`[StatusReportTask] Failed to push new status report: ${pushResult.message}`, pushResult.details ? JSON.stringify(pushResult.details).substring(0,500) : '');
-        // 如果推送到 GitHub 失败，尝试用 logErrorToGitHub 记录这个错误（它本身也会尝试推送到 GitHub 的不同路径）
-        await logErrorToGitHub(env, 'StatusReportPushError', new Error(pushResult.message), `Report Path: ${latestReportFullPath}, Details: ${JSON.stringify(pushResult.details)}`);
-    } else {
-        if (env.LOGGING_ENABLED === "true") console.log(`[StatusReportTask] New status report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
-    }
-}
-
-/**
- * 执行数据维护和一致性检查，并生成报告。
- * (此函数包含检查用户索引文件、索引条目有效性等，以及归档和推送报告)
- * @param {ScheduledEvent | { cron: string, scheduledTime: number }} event
- * @param {object} env
- * @returns {Promise<void>}
- */
-async function performMaintenanceChecks(event, env) {
-    // 功能：执行维护检查，归档旧报告，并生成和推送新报告。
-    // (此函数的完整代码已在之前的回答中提供)
-    if (env.LOGGING_ENABLED === "true") {
-        console.log(`[MaintenanceTask] Starting - Triggered by: ${event.cron}`);
-    }
-    const reportTimestampDate = new Date(event.scheduledTime);
-    const reportTimestampISO = reportTimestampDate.toISOString();
-    let reportContent = `# Data Maintenance & Consistency Report - ${reportTimestampISO}\n\nCron: ${event.cron}\n\n`;
-    let issuesFoundDetails = [];
-
-    // --- 1. 检查用户索引文件是否存在 ---
-    reportContent += `## Phase 1: User Index File Existence Check\n`;
-    if (env.DB) {
-        try {
-            const usersStmt = env.DB.prepare("SELECT user_id FROM Users WHERE status = 'active'");
-            const { results: activeUsers } = await usersStmt.all();
-            if (activeUsers && activeUsers.length > 0) {
-                reportContent += `Checking index files for ${activeUsers.length} active users...\n`;
-                for (const user of activeUsers) {
-                    const indexPath = `${user.user_id}/index.json`;
-                    const indexFileMeta = await githubService.getFileShaFromPath(env, env.GITHUB_REPO_OWNER, env.GITHUB_REPO_NAME, indexPath, env.TARGET_BRANCH || "main");
-                    if (!indexFileMeta) {
-                        const issue = `User '${user.user_id}': index.json NOT FOUND at '${indexPath}'.`;
-                        reportContent += `- **ISSUE**: ${issue}\n`;
-                        issuesFoundDetails.push({ type: "MissingIndexFile", user: user.user_id, path: indexPath, details: issue });
-                    } else {
-                        const { indexData } = await getUserIndexForScheduledTask(env, user.user_id); // 确保此函数可用
-                        if (indexData && indexData.files) {
-                            for (const originalPath in indexData.files) {
-                                const fileHash = indexData.files[originalPath];
-                                const hashedFilePath = `${user.user_id}/${fileHash}`;
-                                const physicalFileMeta = await githubService.getFileShaFromPath(env, env.GITHUB_REPO_OWNER, env.GITHUB_REPO_NAME, hashedFilePath, env.TARGET_BRANCH || "main");
-                                if (!physicalFileMeta) {
-                                    const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) points to non-existent physical file '${hashedFilePath}'.`;
-                                    reportContent += `- **ISSUE**: ${issue}\n`;
-                                    issuesFoundDetails.push({ type: "BrokenIndexLink", user: user.user_id, originalPath, fileHash, physicalPath: hashedFilePath, details: issue });
-                                }
-                            }
-                        }
-                    }
-                }
-                if (issuesFoundDetails.length === 0) {
-                    reportContent += `- All checked active users have an index.json file and basic index links seem valid.\n`;
-                } else {
-                    reportContent += `\n**Total primary issues found: ${issuesFoundDetails.length} (see details below)**\n`;
-                }
-            } else { reportContent += `- No active users to check.\n`; }
-        } catch (dbError) {
-            reportContent += `- Error during maintenance checks (DB query): ${dbError.message}\n\n`;
-            if (env.LOGGING_ENABLED === "true") console.error("[MaintenanceTask] D1 Error during user query:", dbError);
-        }
-    } else { reportContent += `- Maintenance checks requiring D1 (Users table) skipped.\n`; }
-    reportContent += `\n`;
-
-    // ... (可选的孤立文件检查描述) ...
-
-    if (issuesFoundDetails.length > 0) {
-        reportContent += `## Detailed Issues Found:\n`;
-        issuesFoundDetails.forEach(issue => { /* ... 格式化 issue ... */ 
-             reportContent += `### Type: ${issue.type}\n- User: ${issue.user}\n`;
-             if(issue.path) reportContent += `- Path: \`${issue.path}\`\n`;
-             if(issue.originalPath) reportContent += `- Original Path: \`${issue.originalPath}\`\n`;
-             if(issue.fileHash) reportContent += `- Hash: \`${issue.fileHash}\`\n`;
-             if(issue.physicalPath) reportContent += `- Physical Path: \`${issue.physicalPath}\`\n`;
-             reportContent += `- Details: ${issue.details}\n\n`;
-        });
-    }
-    // ... (报告归档和推送逻辑，使用 MAINTENANCE_REPORT_PATH_PREFIX) ...
-    const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
-    const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
-    const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
-    const baseReportDir = env.MAINTENANCE_REPORT_PATH_PREFIX || "system_reports/maintenance/";
-    const latestReportRelativePath = "latest_maintenance_report.md";
-    const latestReportFullPath = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}${latestReportRelativePath}`;
-
-    // 归档
-    const previousReportData = await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch);
-    if (previousReportData && previousReportData.sha) {
-        const archiveDate = new Date(reportTimestampDate.getTime() - (23 * 60 * 60 * 1000 + 59 * 60 * 1000) ); // 23h 59m ago
-        const archiveYear = archiveDate.getUTCFullYear();
-        const archiveMonth = (archiveDate.getUTCMonth() + 1).toString().padStart(2, '0');
-        const archiveDay = archiveDate.getUTCDate().toString().padStart(2, '0');
-        const archiveDir = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}archive/${archiveYear}/${archiveMonth}/${archiveDay}/`;
-        const archivedReportFileName = `${archiveDate.toISOString().replace(/:/g, '-').replace(/\..+/, '')}_maintenance_report.md`;
-        const archivedReportFullPath = `${archiveDir}${archivedReportFileName}`;
-        await moveGitHubFile(env, reportRepoOwner, reportRepoName, reportRepoBranch, latestReportFullPath, archivedReportFullPath, "Chore: Archive maintenance report");
-    }
-
-    // 推送新报告
-    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent));
-    const commitMessage = `System Maintenance Report: ${reportTimestampISO}`;
-    const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha;
-    const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch, reportContentBase64, commitMessage, latestReportShaAfterArchiveAttempt);
-
-    if (pushResult.error) {
-        console.error(`[MaintenanceTask] Failed to push new maintenance report: ${pushResult.message}`, pushResult.details);
-        await logErrorToGitHub(env, 'MaintenanceReportPushError', new Error(pushResult.message), `Report Path: ${latestReportFullPath}, Details: ${JSON.stringify(pushResult.details)}`);
-    } else {
-        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] New maintenance report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
-    }
-}
 
 
 
