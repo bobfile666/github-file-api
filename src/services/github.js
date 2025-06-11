@@ -1,6 +1,8 @@
 // src/services/github.js
 // 描述：封装所有与 GitHub REST API 的交互逻辑。
 
+import { arrayBufferToBase64, base64ToArrayBuffer } from '../utils/crypto.js'; // <--- 新增导入！
+
 const GITHUB_API_BASE = 'https://api.github.com';
 
 /**

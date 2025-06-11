@@ -15,8 +15,9 @@ import {
     handleAdminCreateUser // 也导入这个，以便 dashboard action 可以调用
 } from './handlers/admin.js';
 import { 
-    arrayBufferToBase64, // 确保从 crypto.js 导入
-    calculateSha256      // 确保从 crypto.js 导入
+    verifyAndDecodeDynamicToken, 
+    arrayBufferToBase64, 
+    base64ToArrayBuffer 
 } from './utils/crypto.js';
 import * as githubService from './services/github.js'
 
