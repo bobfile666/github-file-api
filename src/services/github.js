@@ -132,40 +132,85 @@ async function githubApiRequest(url, method, pat, body = null, envForLogging) {
 
 
 /**
- * 获取文件内容和 SHA。
+ * 获取文件内容 (Base64 编码) 和 SHA。
+ * 处理大文件情况：如果 GitHub API 不直接返回 content，则尝试从 download_url 获取。
  * @param {object} env - Worker 环境变量
  * @param {string} owner - 仓库所有者
  * @param {string} repo - 仓库名
  * @param {string} path - 文件路径
  * @param {string} branch - 分支名
- * @returns {Promise<object|null>} - 文件数据 { name, path, sha, size, type, content_base64, encoding, ... } 或 null
+ * @returns {Promise<object|null>} - 文件数据 { name, path, sha, size, type, content_base64, ... } 或 null
  */
 export async function getFileContentAndSha(env, owner, repo, path, branch) {
+    // 功能：获取文件内容（Base64）和元数据，能处理 GitHub 对大文件不直接返回内容的情况。
+    // 参数：env, owner, repo, path, branch
+    // 返回：Promise<object|null> 包含文件数据或 null。
     const apiUrl = `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
-    const responseData = await githubApiRequest(apiUrl, 'GET', env.GITHUB_PAT, null, env);
+    const metadataResponse = await githubApiRequest(apiUrl, 'GET', env.GITHUB_PAT, null, env);
 
-    if (responseData.error) {
-        // 404 Not Found 是预期中的 "文件不存在"
-        if (responseData.status === 404) {
-            if (env.LOGGING_ENABLED === "true") console.log(`File not found at ${path} on branch ${branch}`);
+    if (metadataResponse.error) {
+        if (metadataResponse.status === 404) {
+            if (env.LOGGING_ENABLED === "true") console.log(`[getFileContentAndSha] File not found (404) at ${path} on branch ${branch}`);
             return null;
         }
-        // 其他错误则记录并返回 null
-        console.error(`Failed to get file content for ${path}: ${responseData.message}`);
+        console.error(`[getFileContentAndSha] Failed to get file metadata for ${path}: ${metadataResponse.message} (Status: ${metadataResponse.status})`, metadataResponse.details);
         return null;
     }
-    // GitHub API content is base64 encoded
+
+    // 检查元数据响应是否有效
+    if (typeof metadataResponse !== 'object' || metadataResponse === null || metadataResponse.type !== 'file') {
+        console.error(`[getFileContentAndSha] Invalid metadata response or not a file for ${path}. Type: ${metadataResponse?.type}`, metadataResponse);
+        return null; // 不是文件，或者元数据无效
+    }
+
+    let contentBase64 = metadataResponse.content; // 这是 GitHub API 返回的 base64 内容
+
+    // 如果 content 字段不存在或为空，并且有 download_url (通常表示文件较大)
+    if ((!contentBase64 || contentBase64.trim() === '') && metadataResponse.download_url) {
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[getFileContentAndSha] Content not in metadata for ${path} (size: ${metadataResponse.size} bytes). Fetching from download_url: ${metadataResponse.download_url}`);
+        }
+        try {
+            const downloadResponse = await fetch(metadataResponse.download_url, {
+                headers: {
+                    // 对于 raw.githubusercontent.com 或其他 GitHub 原始文件 URL，通常不需要 PAT，除非仓库是私有的
+                    // 如果 download_url 是 api.github.com 的 blob URL，可能需要 PAT
+                    // 'Authorization': `token ${env.GITHUB_PAT}`, // 根据 download_url 的类型决定是否需要
+                    'User-Agent': 'Cloudflare-Worker-GitHub-File-API',
+                }
+            });
+
+            if (!downloadResponse.ok) {
+                const errorText = await downloadResponse.text();
+                console.error(`[getFileContentAndSha] Failed to download content from download_url for ${path}. Status: ${downloadResponse.status}. Error: ${errorText.substring(0,200)}`);
+                return null; // 下载失败
+            }
+            const fileArrayBuffer = await downloadResponse.arrayBuffer();
+            contentBase64 = arrayBufferToBase64(fileArrayBuffer); // 确保 arrayBufferToBase64 已导入或在此定义
+        } catch (downloadError) {
+            console.error(`[getFileContentAndSha] Exception while downloading content for ${path} from download_url: ${downloadError.message}`, downloadError.stack);
+            return null;
+        }
+    } else if (!contentBase64 && metadataResponse.size > 0) {
+        // 内容为空，但 size 大于 0，且没有 download_url，这是一种异常情况
+        console.warn(`[getFileContentAndSha] Metadata for ${path} indicates size ${metadataResponse.size} but content is missing and no download_url provided.`, metadataResponse);
+        // 视情况可以返回 null 或者尝试其他方式
+        return null;
+    }
+
+
+    // 确保返回的对象结构一致
     return {
-        name: responseData.name,
-        path: responseData.path,
-        sha: responseData.sha,
-        size: responseData.size,
-        type: responseData.type, // "file" or "dir"
-        content_base64: responseData.content, // Base64 encoded content
-        encoding: responseData.encoding, // usually "base64" for files
-        html_url: responseData.html_url,
-        download_url: responseData.download_url,
-        status: responseData.status
+        name: metadataResponse.name,
+        path: metadataResponse.path,
+        sha: metadataResponse.sha,
+        size: metadataResponse.size, // 这是原始文件大小
+        type: metadataResponse.type,
+        content_base64: contentBase64, // 确保这个字段有值 (除非文件是 0 字节)
+        encoding: contentBase64 ? "base64" : metadataResponse.encoding, // 如果我们自己获取并编码，encoding 就是 base64
+        html_url: metadataResponse.html_url,
+        download_url: metadataResponse.download_url, // 原始的 download_url
+        status: metadataResponse.status // 来自获取元数据的 API 调用状态
     };
 }
 
@@ -394,88 +439,7 @@ export async function appendToProblemLogFile(env, owner, repo, branch, username,
     }
 }
 
-/**
- * 获取文件内容 (Base64 编码) 和 SHA。
- * 处理大文件情况：如果 GitHub API 不直接返回 content，则尝试从 download_url 获取。
- * @param {object} env - Worker 环境变量
- * @param {string} owner - 仓库所有者
- * @param {string} repo - 仓库名
- * @param {string} path - 文件路径
- * @param {string} branch - 分支名
- * @returns {Promise<object|null>} - 文件数据 { name, path, sha, size, type, content_base64, ... } 或 null
- */
-export async function getFileContentAndSha(env, owner, repo, path, branch) {
-    // 功能：获取文件内容（Base64）和元数据，能处理 GitHub 对大文件不直接返回内容的情况。
-    // 参数：env, owner, repo, path, branch
-    // 返回：Promise<object|null> 包含文件数据或 null。
-    const apiUrl = `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
-    const metadataResponse = await githubApiRequest(apiUrl, 'GET', env.GITHUB_PAT, null, env);
 
-    if (metadataResponse.error) {
-        if (metadataResponse.status === 404) {
-            if (env.LOGGING_ENABLED === "true") console.log(`[getFileContentAndSha] File not found (404) at ${path} on branch ${branch}`);
-            return null;
-        }
-        console.error(`[getFileContentAndSha] Failed to get file metadata for ${path}: ${metadataResponse.message} (Status: ${metadataResponse.status})`, metadataResponse.details);
-        return null;
-    }
-
-    // 检查元数据响应是否有效
-    if (typeof metadataResponse !== 'object' || metadataResponse === null || metadataResponse.type !== 'file') {
-        console.error(`[getFileContentAndSha] Invalid metadata response or not a file for ${path}. Type: ${metadataResponse?.type}`, metadataResponse);
-        return null; // 不是文件，或者元数据无效
-    }
-
-    let contentBase64 = metadataResponse.content; // 这是 GitHub API 返回的 base64 内容
-
-    // 如果 content 字段不存在或为空，并且有 download_url (通常表示文件较大)
-    if ((!contentBase64 || contentBase64.trim() === '') && metadataResponse.download_url) {
-        if (env.LOGGING_ENABLED === "true") {
-            console.log(`[getFileContentAndSha] Content not in metadata for ${path} (size: ${metadataResponse.size} bytes). Fetching from download_url: ${metadataResponse.download_url}`);
-        }
-        try {
-            const downloadResponse = await fetch(metadataResponse.download_url, {
-                headers: {
-                    // 对于 raw.githubusercontent.com 或其他 GitHub 原始文件 URL，通常不需要 PAT，除非仓库是私有的
-                    // 如果 download_url 是 api.github.com 的 blob URL，可能需要 PAT
-                    // 'Authorization': `token ${env.GITHUB_PAT}`, // 根据 download_url 的类型决定是否需要
-                    'User-Agent': 'Cloudflare-Worker-GitHub-File-API',
-                }
-            });
-
-            if (!downloadResponse.ok) {
-                const errorText = await downloadResponse.text();
-                console.error(`[getFileContentAndSha] Failed to download content from download_url for ${path}. Status: ${downloadResponse.status}. Error: ${errorText.substring(0,200)}`);
-                return null; // 下载失败
-            }
-            const fileArrayBuffer = await downloadResponse.arrayBuffer();
-            contentBase64 = arrayBufferToBase64(fileArrayBuffer); // 确保 arrayBufferToBase64 已导入或在此定义
-        } catch (downloadError) {
-            console.error(`[getFileContentAndSha] Exception while downloading content for ${path} from download_url: ${downloadError.message}`, downloadError.stack);
-            return null;
-        }
-    } else if (!contentBase64 && metadataResponse.size > 0) {
-        // 内容为空，但 size 大于 0，且没有 download_url，这是一种异常情况
-        console.warn(`[getFileContentAndSha] Metadata for ${path} indicates size ${metadataResponse.size} but content is missing and no download_url provided.`, metadataResponse);
-        // 视情况可以返回 null 或者尝试其他方式
-        return null;
-    }
-
-
-    // 确保返回的对象结构一致
-    return {
-        name: metadataResponse.name,
-        path: metadataResponse.path,
-        sha: metadataResponse.sha,
-        size: metadataResponse.size, // 这是原始文件大小
-        type: metadataResponse.type,
-        content_base64: contentBase64, // 确保这个字段有值 (除非文件是 0 字节)
-        encoding: contentBase64 ? "base64" : metadataResponse.encoding, // 如果我们自己获取并编码，encoding 就是 base64
-        html_url: metadataResponse.html_url,
-        download_url: metadataResponse.download_url, // 原始的 download_url
-        status: metadataResponse.status // 来自获取元数据的 API 调用状态
-    };
-}
 
 
 
