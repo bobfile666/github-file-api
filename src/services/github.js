@@ -180,28 +180,33 @@ export async function getFileContentAndSha(env, owner, repo, path, branch) {
  * @returns {Promise<object|null>} - 文件元数据 { name, path, sha, size, type, ... } 或 null
  */
 export async function getFileShaFromPath(env, owner, repo, path, branch) {
-    // GitHub contents API GET 请求不带文件内容时，如果文件存在，会返回元数据包括 SHA
-    // 如果你想强制不获取内容（例如对于大文件只检查存在性），可以使用 HEAD 请求，
-    // 但 HEAD 请求的响应头可能不直接包含所有元数据如 SHA，而是通过 Link 头等。
-    // 这里我们继续用 GET，因为 Worker 获取内容通常不那么昂贵。
+    // 功能：获取文件（或目录）的 SHA 和元数据，更好地区分错误。
     const apiUrl = `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
+    // responseData 将包含 { error: true, message: ..., status: ..., details: ... } 或成功的数据
     const responseData = await githubApiRequest(apiUrl, 'GET', env.GITHUB_PAT, null, env);
 
     if (responseData.error) {
-        if (responseData.status === 404) return null; // 文件不存在
-        console.error(`Failed to get file SHA for ${path}: ${responseData.message}`);
-        return null;
+        if (responseData.status === 404) {
+            // 文件明确不存在
+            if (env.LOGGING_ENABLED === "true") console.log(`[getFileShaFromPath] File definitely not found (404): ${path} on branch ${branch}`);
+            return { exists: false, error: null, status: 404 }; 
+        }
+        // 其他类型的错误，例如 API 限流、权限问题等
+        if (env.LOGGING_ENABLED === "true") console.error(`[getFileShaFromPath] Error getting SHA for ${path} (Status: ${responseData.status}): ${responseData.message}`);
+        return { exists: false, error: responseData.message, status: responseData.status, details: responseData.details };
     }
+    // 文件存在
     return {
+        exists: true,
         name: responseData.name,
         path: responseData.path,
         sha: responseData.sha,
         size: responseData.size,
         type: responseData.type,
-        status: responseData.status
+        status: responseData.status, // 成功时的状态码 (200)
+        error: null
     };
 }
-
 
 /**
  * 创建或更新 GitHub 上的文件。
@@ -291,3 +296,40 @@ export async function ensureFileExists(env, owner, repo, path, branch, initialCo
     // 文件不存在，调用 createFileOrUpdateFile (sha 为 null) 来创建
     return createFileOrUpdateFile(env, owner, repo, path, branch, initialContentBase64, commitMessage, null);
 }
+
+/**
+ * 列出 GitHub 仓库中指定目录的内容。
+ * @param {object} env - Worker 环境变量
+ * @param {string} owner - 仓库所有者
+ * @param {string} repo - 仓库名
+ * @param {string} dirPath - 目录路径 (空字符串表示根目录)
+ * @param {string} branch - 分支名
+ * @returns {Promise<{files: Array<object>, error?: string, status?: number}>} 包含文件/目录对象数组或错误信息
+ */
+export async function listDirectoryContents(env, owner, repo, dirPath, branch) {
+    // 功能：获取指定目录下的文件和子目录列表。
+    // 参数：env, owner, repo, dirPath, branch
+    // 返回：Promise<{files: Array<object> (GitHub API 的 item 结构), error?, status?}>
+    const apiUrl = `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${dirPath}?ref=${branch}`;
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[GitHubService] Listing directory contents: ${apiUrl}`);
+    }
+    const responseData = await githubApiRequest(apiUrl, 'GET', env.GITHUB_PAT, null, env);
+
+    if (responseData.error) {
+        if (responseData.status === 404) { // 目录不存在
+            if (env.LOGGING_ENABLED === "true") console.log(`[GitHubService] Directory not found (404): ${dirPath}`);
+            return { files: [], error: "Directory not found", status: 404 }; // 返回空数组和错误信息
+        }
+        if (env.LOGGING_ENABLED === "true") console.error(`[GitHubService] Error listing directory ${dirPath}: ${responseData.message}`);
+        return { files: [], error: responseData.message, status: responseData.status };
+    }
+
+    if (!Array.isArray(responseData)) {
+        if (env.LOGGING_ENABLED === "true") console.error(`[GitHubService] Expected array from listDirectoryContents for ${dirPath}, got:`, typeof responseData);
+        return { files: [], error: "Invalid response format from GitHub API (expected array).", status: 500 };
+    }
+    
+    return { files: responseData, error: null, status: 200 };
+}
+

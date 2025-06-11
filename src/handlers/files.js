@@ -258,10 +258,9 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
         if (!encryptedFileData || !encryptedFileData.content_base64) {
             logEntry.error_message = `Encrypted physical file (hash: ${fileHash}) not found at '${hashedFilePath}'. Index/Storage inconsistency.`;
             const err = new Error(logEntry.error_message); 
-            // 即使GitHub返回404，但由于这是数据不一致，我们将其视为服务器内部问题
-            err.status = 500; // <--- **重要：将此错误的状态码标记为500系列**
+            err.status = 503; // 或 500. 503 Service Unavailable 可能更贴切，表示暂时无法提供此文件
             err.isServerError = true; 
-            err.details = { expectedPath: hashedFilePath, githubResponseStatus: encryptedFileData?.status || 404 }; // 保留原始GitHub状态
+            err.details = { expectedPath: hashedFilePath, githubResponseStatus: encryptedFileData?.status || 404 };
             throw err; // 这个错误会冒泡到 index.js
         }
         

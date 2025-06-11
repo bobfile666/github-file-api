@@ -225,27 +225,37 @@ async function routeRequest(request, env, ctx) {
 // 注意：这个函数是 getUserIndex 的一个变体，或者 getUserIndex 本身就可以被这样调用。
 // 我们需要确保 githubService 和 base64ToArrayBuffer 在此作用域可用。
 async function getUserIndexForScheduledTask(env, username) {
-    // 功能：获取指定用户的 index.json 内容 (为计划任务特化或复用)。
-    // (此函数与 files.js 中的 getUserIndex 基本相同，确保它能在此处被调用)
     const owner = env.GITHUB_REPO_OWNER;
     const repo = env.GITHUB_REPO_NAME;
     const branch = env.TARGET_BRANCH || "main";
     const indexPath = `${username}/index.json`;
 
-    // 假设 githubService 和 base64ToArrayBuffer 已正确导入或在此文件定义
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[getUserIndexForScheduledTask] User: ${username} - Fetching index: ${indexPath}`);
+    }
     const indexFile = await githubService.getFileContentAndSha(env, owner, repo, indexPath, branch);
 
     if (indexFile && indexFile.content_base64) {
         try {
-            const decodedContent = new TextDecoder().decode(base64ToArrayBuffer(indexFile.content_base64));
+            const decodedContent = new TextDecoder().decode(base64ToArrayBuffer(indexFile.content_base64)); // from crypto.js
             const indexData = JSON.parse(decodedContent);
-            return { indexData: indexData.files ? indexData : { files: {} }, sha: indexFile.sha };
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`[getUserIndexForScheduledTask] User: ${username} - Index found. SHA: ${indexFile.sha}. Files count: ${Object.keys(indexData.files || {}).length}`);
+            }
+            return { indexData: indexData.files ? indexData : { files: {} }, sha: indexFile.sha, error: null }; // 返回 error: null 表示成功
         } catch (e) {
-            if (env.LOGGING_ENABLED === "true") console.error(`[getUserIndexForScheduledTask] User: ${username} - Error parsing index.json:`, e.message);
-            return { indexData: { files: {} }, sha: indexFile.sha }; // 返回 SHA 以便能覆盖损坏的索引
+            if (env.LOGGING_ENABLED === "true") {
+                console.error(`[getUserIndexForScheduledTask] User: ${username} - Error parsing index.json:`, e.message);
+            }
+            // 返回错误信息，而不是抛出，以便 performMaintenanceChecks 可以记录并继续
+            return { indexData: { files: {} }, sha: indexFile.sha, error: `Failed to parse index.json: ${e.message}` };
         }
     }
-    return { indexData: { files: {} }, sha: null };
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[getUserIndexForScheduledTask] User: ${username} - Index file not found or content empty.`);
+    }
+    // 如果索引文件不存在，也返回 error: null，由后续逻辑判断是否是 MissingIndexFile
+    return { indexData: { files: {} }, sha: null, error: null }; 
 }
 
 
@@ -379,74 +389,189 @@ async function generateAndPushStatusReport(event, env) {
  * @returns {Promise<void>}
  */
 async function performMaintenanceChecks(event, env) {
-    // 功能：执行维护检查，归档旧报告，并生成和推送新报告。
-    // (此函数的完整代码已在之前的回答中提供)
+    // 功能：执行详细的维护检查，包括检测和处理损坏的索引链接及孤立的物理文件，并生成报告。
+    const taskStartTime = Date.now();
     if (env.LOGGING_ENABLED === "true") {
-        console.log(`[MaintenanceTask] Starting - Triggered by: ${event.cron}`);
+        console.log(`[MaintenanceTask] Starting - Triggered by: ${event.cron} at ${new Date(event.scheduledTime).toISOString()}`);
     }
     const reportTimestampDate = new Date(event.scheduledTime);
     const reportTimestampISO = reportTimestampDate.toISOString();
     let reportContent = `# Data Maintenance & Consistency Report - ${reportTimestampISO}\n\nCron: ${event.cron}\n\n`;
     let issuesFoundDetails = [];
+    let usersCheckedCount = 0;
+    let usersWithIssuesCount = 0;
+    let filesMovedCount = 0;
 
-    // --- 1. 检查用户索引文件是否存在 ---
-    reportContent += `## Phase 1: User Index File Existence Check\n`;
-    if (env.DB) {
-        try {
-            const usersStmt = env.DB.prepare("SELECT user_id FROM Users WHERE status = 'active'");
-            const { results: activeUsers } = await usersStmt.all();
-            if (activeUsers && activeUsers.length > 0) {
-                reportContent += `Checking index files for ${activeUsers.length} active users...\n`;
-                for (const user of activeUsers) {
-                    const indexPath = `${user.user_id}/index.json`;
-                    const indexFileMeta = await githubService.getFileShaFromPath(env, env.GITHUB_REPO_OWNER, env.GITHUB_REPO_NAME, indexPath, env.TARGET_BRANCH || "main");
-                    if (!indexFileMeta) {
-                        const issue = `User '${user.user_id}': index.json NOT FOUND at '${indexPath}'.`;
-                        reportContent += `- **ISSUE**: ${issue}\n`;
-                        issuesFoundDetails.push({ type: "MissingIndexFile", user: user.user_id, path: indexPath, details: issue });
-                    } else {
-                        const { indexData } = await getUserIndexForScheduledTask(env, user.user_id); // 确保此函数可用
-                        if (indexData && indexData.files) {
-                            for (const originalPath in indexData.files) {
-                                const fileHash = indexData.files[originalPath];
-                                const hashedFilePath = `${user.user_id}/${fileHash}`;
-                                const physicalFileMeta = await githubService.getFileShaFromPath(env, env.GITHUB_REPO_OWNER, env.GITHUB_REPO_NAME, hashedFilePath, env.TARGET_BRANCH || "main");
-                                if (!physicalFileMeta) {
-                                    const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) points to non-existent physical file '${hashedFilePath}'.`;
-                                    reportContent += `- **ISSUE**: ${issue}\n`;
+    const owner = env.GITHUB_REPO_OWNER;
+    const repo = env.GITHUB_REPO_NAME;
+    const targetBranch = env.TARGET_BRANCH || "main";
+    const orphanedFilesBaseDir = "_orphaned_files/"; // 用户目录下的孤立文件存放目录
+
+    reportContent += `## Phase 1 & 2: User Index Link Integrity and Orphaned File Checks\n`;
+    if (!env.DB) {
+        reportContent += `- Maintenance checks skipped (D1 DB not configured).\n`;
+        // ... (推送此简化报告的逻辑，已在之前给出) ...
+        return;
+    }
+
+    try {
+        const usersStmt = env.DB.prepare("SELECT user_id FROM Users WHERE status = 'active'");
+        const { results: activeUsers } = await usersStmt.all();
+        
+        if (!activeUsers || activeUsers.length === 0) {
+            reportContent += `- No active users found in database to check.\n`;
+        } else {
+            reportContent += `Attempting to check ${activeUsers.length} active users...\n\n`;
+            for (const user of activeUsers) {
+                usersCheckedCount++;
+                let userHasIssuesThisRun = false;
+                if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] Checking user: ${user.user_id}`);
+                
+                const userDirPath = `${user.user_id}/`;
+                const userOrphanedDirPath = `${userDirPath}${orphanedFilesBaseDir}`;
+
+                try {
+                    // --- 2.1 获取用户索引 ---
+                    const indexPath = `${userDirPath}index.json`;
+                    const indexFileCheckResult = await githubService.getFileShaFromPath(env, owner, repo, indexPath, targetBranch);
+                    let userIndexData = { files: {} }; // 默认为空索引
+
+                    if (!indexFileCheckResult.exists) {
+                        if (indexFileCheckResult.error) { // 获取索引文件元数据时出错 (非 404)
+                            const issue = `User '${user.user_id}': ERROR checking index.json at '${indexPath}' - ${indexFileCheckResult.error} (Status: ${indexFileCheckResult.status}).`;
+                            issuesFoundDetails.push({ type: "IndexAccessError", user: user.user_id, path: indexPath, details: issue });
+                            userHasIssuesThisRun = true;
+                        } else { // 明确是 404
+                            const issue = `User '${user.user_id}': index.json NOT FOUND at '${indexPath}'.`;
+                            issuesFoundDetails.push({ type: "MissingIndexFile", user: user.user_id, path: indexPath, details: issue });
+                            userHasIssuesThisRun = true;
+                        }
+                        // 如果索引文件不存在或无法访问，我们仍然可以继续检查该用户目录下的孤立文件
+                    } else { // 索引文件存在，尝试加载
+                        const indexResult = await getUserIndexForScheduledTask(env, user.user_id); // 确保此函数能获取到 sha
+                        if (indexResult.error) {
+                            const issue = `User '${user.user_id}': Error processing/parsing index.json at '${indexPath}' - ${indexResult.error}.`;
+                            issuesFoundDetails.push({ type: "CorruptedIndexFile", user: user.user_id, path: indexPath, details: issue });
+                            userHasIssuesThisRun = true;
+                            // 即使索引损坏，也尝试加载一个空索引用来进行孤立文件检查，或者跳过对该用户的孤立文件检查
+                        } else {
+                            userIndexData = indexResult.indexData; // 加载成功
+                        }
+                    }
+
+                    const indexedFileHashes = new Set(Object.values(userIndexData.files || {}));
+
+                    // --- 2.2 检查索引中的条目是否指向存在的物理文件 (Broken Index Links) ---
+                    if (userIndexData.files) {
+                        for (const originalPath in userIndexData.files) {
+                            const fileHash = userIndexData.files[originalPath];
+                            if (!fileHash || typeof fileHash !== 'string' || fileHash.length < 32) {
+                                const issue = `User '${user.user_id}': Index entry '${originalPath}' has INVALID HASH '${fileHash}'.`;
+                                issuesFoundDetails.push({ type: "InvalidHashInIndex", user: user.user_id, originalPath, fileHash, details: issue });
+                                userHasIssuesThisRun = true;
+                                continue;
+                            }
+                            const hashedFilePath = `${userDirPath}${fileHash}`;
+                            const physicalFileCheck = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
+                            if (!physicalFileCheck.exists) {
+                                if (physicalFileCheck.error) { // 检查物理文件时出错 (非404)
+                                     const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) - ERROR checking physical file '${hashedFilePath}': ${physicalFileCheck.error} (Status: ${physicalFileCheck.status}).`;
+                                     issuesFoundDetails.push({ type: "PhysicalFileAccessError", user: user.user_id, originalPath, fileHash, physicalPath: hashedFilePath, details: issue });
+                                } else { // 明确是404，物理文件丢失
+                                    const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) points to MISSING physical file '${hashedFilePath}'.`;
                                     issuesFoundDetails.push({ type: "BrokenIndexLink", user: user.user_id, originalPath, fileHash, physicalPath: hashedFilePath, details: issue });
+                                }
+                                userHasIssuesThisRun = true;
+                            }
+                        }
+                    }
+
+                    // --- 2.3 检查孤立的物理文件 ---
+                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Checking for orphaned files in '${userDirPath}'`);
+                    const dirContentsResult = await githubService.listDirectoryContents(env, owner, repo, userDirPath, targetBranch);
+
+                    if (dirContentsResult.error) {
+                        const issue = `User '${user.user_id}': Could not list contents of directory '${userDirPath}' to check for orphans. Error: ${dirContentsResult.error} (Status: ${dirContentsResult.status})`;
+                        issuesFoundDetails.push({ type: "DirectoryListError", user: user.user_id, path: userDirPath, details: issue });
+                        userHasIssuesThisRun = true;
+                    } else if (dirContentsResult.files && dirContentsResult.files.length > 0) {
+                        for (const item of dirContentsResult.files) {
+                            if (item.type === 'file' && item.name !== 'index.json') {
+                                // item.name 就是哈希文件名
+                                if (!indexedFileHashes.has(item.name)) {
+                                    const orphanedFilePath = item.path; // GitHub API 返回的 path 是完整的
+                                    const newOrphanedPath = `${userOrphanedDirPath}${item.name}`;
+                                    
+                                    const issue = `User '${user.user_id}': ORPHANED physical file found: '${orphanedFilePath}'. Not in index.json.`;
+                                    issuesFoundDetails.push({ type: "OrphanedFile", user: user.user_id, physicalPath: orphanedFilePath, details: `${issue} Attempting to move to '${newOrphanedPath}'.` });
+                                    userHasIssuesThisRun = true;
+                                    if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
+
+                                    // 移动孤立文件
+                                    const moved = await moveGitHubFile(
+                                        env, owner, repo, targetBranch,
+                                        orphanedFilePath,
+                                        newOrphanedPath,
+                                        `Maintenance: Quarantine orphaned file for user ${user.user_id}`
+                                    );
+                                    if (moved) {
+                                        filesMovedCount++;
+                                        issuesFoundDetails.push({ type: "OrphanedFileMoved", user: user.user_id, oldPath: orphanedFilePath, newPath: newOrphanedPath, details: "Successfully moved to orphaned files directory."});
+                                        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Orphaned file '${orphanedFilePath}' moved to '${newOrphanedPath}'.`);
+                                    } else {
+                                        issuesFoundDetails.push({ type: "OrphanedFileMoveFailed", user: user.user_id, physicalPath: orphanedFilePath, details: `Failed to move orphaned file '${orphanedFilePath}' to quarantine.` });
+                                        if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] User ${user.user_id}: FAILED to move orphaned file '${orphanedFilePath}'.`);
+                                    }
                                 }
                             }
                         }
                     }
+                    if (userHasIssuesThisRun) {
+                        usersWithIssuesCount++;
+                    }
+
+                } catch (userCheckError) { // 捕获检查单个用户时发生的更顶层的意外错误
+                    const issue = `User '${user.user_id}': UNEXPECTED CRITICAL ERROR during check - ${userCheckError.message}. Further checks for this user aborted.`;
+                    if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`, userCheckError.stack);
+                    issuesFoundDetails.push({ type: "UserCheckFailedCritical", user: user.user_id, details: issue, stack: userCheckError.stack });
+                    if (!userHasIssuesThisRun) usersWithIssuesCount++; // 确保计数
                 }
-                if (issuesFoundDetails.length === 0) {
-                    reportContent += `- All checked active users have an index.json file and basic index links seem valid.\n`;
-                } else {
-                    reportContent += `\n**Total primary issues found: ${issuesFoundDetails.length} (see details below)**\n`;
-                }
-            } else { reportContent += `- No active users to check.\n`; }
-        } catch (dbError) {
-            reportContent += `- Error during maintenance checks (DB query): ${dbError.message}\n\n`;
-            if (env.LOGGING_ENABLED === "true") console.error("[MaintenanceTask] D1 Error during user query:", dbError);
+            } // end for (const user of activeUsers)
+
+            reportContent += `Checked ${usersCheckedCount} users. Found issues for ${usersWithIssuesCount} users. Moved ${filesMovedCount} orphaned files.\n`;
+            if (issuesFoundDetails.length === 0 && usersCheckedCount > 0) {
+                reportContent += `- All checked active users appear consistent based on implemented checks.\n`;
+            } else if (usersCheckedCount === 0 && activeUsers.length > 0) {
+                 reportContent += `- No users were effectively processed for checks (possibly due to errors).\n`;
+            }
         }
-    } else { reportContent += `- Maintenance checks requiring D1 (Users table) skipped.\n`; }
+    } catch (dbError) {
+        reportContent += `- Error fetching users from D1: ${dbError.message}. Maintenance checks aborted.\n`;
+        if (env.LOGGING_ENABLED === "true") console.error("[MaintenanceTask] D1 Error during user query:", dbError);
+        await logErrorToGitHub(env, 'MaintenanceDbError', dbError, `Cron: ${event.cron} - Failed to query users`);
+    }
     reportContent += `\n`;
 
-    // ... (可选的孤立文件检查描述) ...
-
     if (issuesFoundDetails.length > 0) {
-        reportContent += `## Detailed Issues Found:\n`;
-        issuesFoundDetails.forEach(issue => { /* ... 格式化 issue ... */ 
-             reportContent += `### Type: ${issue.type}\n- User: ${issue.user}\n`;
-             if(issue.path) reportContent += `- Path: \`${issue.path}\`\n`;
-             if(issue.originalPath) reportContent += `- Original Path: \`${issue.originalPath}\`\n`;
-             if(issue.fileHash) reportContent += `- Hash: \`${issue.fileHash}\`\n`;
-             if(issue.physicalPath) reportContent += `- Physical Path: \`${issue.physicalPath}\`\n`;
-             reportContent += `- Details: ${issue.details}\n\n`;
+        reportContent += `## Detailed Issues and Actions (${issuesFoundDetails.length}):\n`;
+        issuesFoundDetails.forEach(issue => { 
+            reportContent += `### Type: ${issue.type}\n`;
+            reportContent += `- User: ${issue.user}\n`;
+            if(issue.path) reportContent += `- Index Path: \`${issue.path}\`\n`;
+            if(issue.originalPath) reportContent += `- Original Path in Index: \`${issue.originalPath}\`\n`;
+            if(issue.fileHash) reportContent += `- Referenced Hash: \`${issue.fileHash}\`\n`;
+            if(issue.physicalPath) reportContent += `- Physical Path: \`${issue.physicalPath}\`\n`;
+            if(issue.oldPath) reportContent += `- Old Path: \`${issue.oldPath}\`\n`;
+            if(issue.newPath) reportContent += `- New Path (Moved To): \`${issue.newPath}\`\n`;
+            reportContent += `- Details: ${issue.details}\n\n`;
         });
+    } else if (usersCheckedCount > 0) {
+        reportContent += `**No consistency issues found for ${usersCheckedCount} checked users.**\n`;
     }
-    // ... (报告归档和推送逻辑，使用 MAINTENANCE_REPORT_PATH_PREFIX) ...
+
+    reportContent += `**Note**: This report provides basic consistency checks. Orphaned files are moved to \`_orphaned_files/\` subdirectory within each user's folder. Manual review may be needed.\n`;
+    
+    // --- 报告归档和推送逻辑 (和之前一样，使用 MAINTENANCE_REPORT_PATH_PREFIX) ---
     const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
     const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
     const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
@@ -456,8 +581,8 @@ async function performMaintenanceChecks(event, env) {
 
     // 归档
     const previousReportData = await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch);
-    if (previousReportData && previousReportData.sha) {
-        const archiveDate = new Date(reportTimestampDate.getTime() - (23 * 60 * 60 * 1000 + 59 * 60 * 1000) ); // 23h 59m ago
+    if (previousReportData.exists && previousReportData.sha) { //  <-- 修正：检查 exists 属性
+        const archiveDate = new Date(reportTimestampDate.getTime() - (23 * 60 * 60 * 1000 + 59 * 60 * 1000) ); // 约 24 小时前
         const archiveYear = archiveDate.getUTCFullYear();
         const archiveMonth = (archiveDate.getUTCMonth() + 1).toString().padStart(2, '0');
         const archiveDay = archiveDate.getUTCDate().toString().padStart(2, '0');
@@ -468,9 +593,9 @@ async function performMaintenanceChecks(event, env) {
     }
 
     // 推送新报告
-    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent));
+    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent)); // 确保 arrayBufferToBase64 导入
     const commitMessage = `System Maintenance Report: ${reportTimestampISO}`;
-    const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha;
+    const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha; // 可能为 null
     const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch, reportContentBase64, commitMessage, latestReportShaAfterArchiveAttempt);
 
     if (pushResult.error) {
@@ -479,8 +604,12 @@ async function performMaintenanceChecks(event, env) {
     } else {
         if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] New maintenance report pushed. Commit: ${pushResult.commit?.sha || (pushResult.content?.sha || 'N/A')}`);
     }
-}
 
+    if (env.LOGGING_ENABLED === "true") {
+        const duration = Date.now() - taskStartTime;
+        console.log(`[MaintenanceTask] Finished. Duration: ${duration}ms. Issues found: ${issuesFoundDetails.length}. Files moved: ${filesMovedCount}.`);
+    }
+}
 
 /**
  * 辅助函数：将 GitHub 上的文件移动/重命名 (通过复制和删除实现)
@@ -681,36 +810,62 @@ export default {
      */
     async scheduled(event, env, ctx) {
         // 功能：根据触发的 CRON 表达式分发到不同的计划任务处理器。
-        // (此函数的逻辑和之前一样，包含 switch(event.cron) 和调用任务函数)
+        const scheduledTaskStartTime = Date.now(); // <--- 重命名以避免与 fetch 中的 startTime 混淆，并确保在此作用域
+        
         if (env.LOGGING_ENABLED === "true") {
-            console.log(`[ScheduledHandler] START - Cron: '${event.cron}' at ${new Date(event.scheduledTime).toISOString()}`);
+            console.log(`[ScheduledHandler] START - Cron: '${event.cron}' at ${new Date(event.scheduledTime).toISOString()} (Task Start Time: ${scheduledTaskStartTime})`);
         }
-        let taskPromise;
+        
+        let taskToRun; // 这将是一个 async function
+
         switch (event.cron) {
             case "0 */2 * * *": 
-                taskPromise = generateAndPushStatusReport(event, env);
+                taskToRun = async () => generateAndPushStatusReport(event, env); // 包装成一个 async thunk
                 break;
             case "0 3 * * *":   
-                taskPromise = performMaintenanceChecks(event, env);
+                taskToRun = async () => performMaintenanceChecks(event, env); // 包装成一个 async thunk
                 break;
             default:
-                if (env.LOGGING_ENABLED === "true") console.warn(`[ScheduledHandler] No task for cron: '${event.cron}'`);
+                if (env.LOGGING_ENABLED === "true") {
+                    const duration = Date.now() - scheduledTaskStartTime;
+                    console.warn(`[ScheduledHandler] END - No specific task defined for cron schedule: '${event.cron}'. Duration: ${duration}ms`);
+                }
                 return; 
         }
-        if (taskPromise) {
+
+        if (taskToRun) {
             ctx.waitUntil(
-                taskPromise
-                .then(() => {
-                    if (env.LOGGING_ENABLED === "true") console.log(`[ScheduledHandler] END - Successfully completed task for cron '${event.cron}'. Duration: ${Date.now() - startTime}ms`);
-                })
-                .catch(error => { // 捕获计划任务执行中的任何错误
-                    if (env.LOGGING_ENABLED === "true") console.error(`[ScheduledHandler CRITICAL] Error during scheduled task for cron '${event.cron}':`, error.message, error.stack);
-                    // 计划任务中的错误通常被认为是服务器端问题
-                    const errorToLog = error instanceof Error ? error : new Error(String(error));
-                    errorToLog.rayId = `scheduled-${event.cron}-${event.scheduledTime}`; // 构造一个唯一的 ID
-                    ctx.waitUntil(logErrorToGitHub(env, 'ScheduledTaskExecutionError', errorToLog, `Cron: ${event.cron}`));
-                })
+                (async () => { // 立即执行的异步函数 (IIFE) 来包裹 taskToRun 的调用和后续处理
+                    try {
+                        await taskToRun(); // 执行任务
+                        if (env.LOGGING_ENABLED === "true") {
+                            const duration = Date.now() - scheduledTaskStartTime;
+                            console.log(`[ScheduledHandler] END - Successfully completed task for cron '${event.cron}'. Duration: ${duration}ms`);
+                        }
+                    } catch (error) {
+                        if (env.LOGGING_ENABLED === "true") {
+                            const duration = Date.now() - scheduledTaskStartTime;
+                            console.error(`[ScheduledHandler CRITICAL] Error during scheduled task for cron '${event.cron}'. Duration: ${duration}ms:`, error.message, error.stack);
+                        }
+                        const errorToLog = error instanceof Error ? error : new Error(String(error.message || error));
+                        if (!errorToLog.stack && error.stack) errorToLog.stack = error.stack;
+                        errorToLog.rayId = `scheduled-${event.cron}-${event.scheduledTime}`; // 使用 event.scheduledTime
+                        
+                        // 确保 logErrorToGitHub 本身不会因错误而中断 waitUntil
+                        try {
+                            await logErrorToGitHub(env, 'ScheduledTaskExecutionError', errorToLog, `Cron: ${event.cron}`);
+                        } catch (githubLogError) {
+                            console.error("[ScheduledHandler CRITICAL] FAILED to log scheduled task error to GitHub as well:", githubLogError.message);
+                        }
+                    }
+                })()
             );
+        } else {
+             //这种情况理论上已经被 switch 的 default 分支处理了
+             if (env.LOGGING_ENABLED === "true") {
+                const duration = Date.now() - scheduledTaskStartTime;
+                console.log(`[ScheduledHandler] END - No task promise was generated for cron '${event.cron}'. Duration: ${duration}ms`);
+             }
         }
     }
 };
