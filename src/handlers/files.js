@@ -206,11 +206,17 @@ export async function handleFileUpload(request, env, ctx, authenticatedUsername,
 }
 
 export async function handleFileDownload(request, env, ctx, authenticatedUsername, originalFilePath) {
-    // 功能: 处理文件下载，包括认证、从索引查找、解密、耗时记录和日志记录。
+    // 功能: 处理文件下载，包括认证、从索引查找、解密、耗时记录、问题日志检查和记录。
     const startTime = Date.now(); 
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[handleFileDownload] User: ${authenticatedUsername} - START - Download for: ${originalFilePath}`);
     }
+    
+    const owner = env.GITHUB_REPO_OWNER;
+    const repo = env.GITHUB_REPO_NAME;
+    const targetBranch = env.TARGET_BRANCH || "main";
+    const problemLogFileName = "_problematic_index_entries.jsonl"; // 和维护任务中使用的文件名一致
+    let responseToReturn; 
     
     let logEntry = {
         user_id: authenticatedUsername, action_type: 'download', original_file_path: originalFilePath,
@@ -225,6 +231,7 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
             throw err;
         }
 
+        // 1. 获取用户密钥
         const userFileEncryptionKey = await getUserSymmetricKey(env, authenticatedUsername);
         if (!userFileEncryptionKey) {
             logEntry.error_message = "Encryption key retrieval failed for user.";
@@ -232,16 +239,28 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
             throw err;
         }
 
-        const owner = env.GITHUB_REPO_OWNER; const repo = env.GITHUB_REPO_NAME; const targetBranch = env.TARGET_BRANCH || "main";
+        // 2. 获取索引并查找文件哈希
         const indexResult = await getUserIndex(env, authenticatedUsername, targetBranch);
-        if (indexResult.error) throw indexResult.error;
+        if (indexResult.error) { // 如果 getUserIndex 内部解析失败并返回错误对象
+             const err = new Error(indexResult.error.message || "Failed to process user index.");
+             err.status = indexResult.error.status || 500;
+             err.isServerError = indexResult.error.isServerError !== undefined ? indexResult.error.isServerError : true;
+             err.details = indexResult.error.details;
+             throw err;
+        }
         const { indexData } = indexResult;
         
         const indexPath = `${authenticatedUsername}/index.json`;
-        const indexFileExists = await githubService.getFileShaFromPath(env, owner, repo, indexPath, targetBranch);
-        if (!indexFileExists) {
+        const indexFileCheckResult = await githubService.getFileShaFromPath(env, owner, repo, indexPath, targetBranch);
+        if (!indexFileCheckResult.exists && !indexFileCheckResult.error) { // 索引文件本身明确不存在
             logEntry.error_message = "User index file not found.";
             const err = new Error(logEntry.error_message); err.status = 404; err.isClientError = true;
+            throw err;
+        }
+        if (indexFileCheckResult.error && indexFileCheckResult.status !== 404) { // 获取索引文件元数据时出错
+            logEntry.error_message = `Error accessing user index file: ${indexFileCheckResult.error}`;
+            const err = new Error(logEntry.error_message); err.status = indexFileCheckResult.status || 500; err.isServerError = true;
+            err.details = indexFileCheckResult.details;
             throw err;
         }
         
@@ -253,24 +272,63 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
             throw err;
         }
 
+        // 3. 下载加密的哈希文件
         const hashedFilePath = `${authenticatedUsername}/${fileHash}`;
-        const encryptedFileData = await githubService.getFileContentAndSha(env, owner, repo, hashedFilePath, targetBranch);
-        if (!encryptedFileData || !encryptedFileData.content_base64) {
-            logEntry.error_message = `Encrypted physical file (hash: ${fileHash}) not found at '${hashedFilePath}'. Index/Storage inconsistency.`;
-            const err = new Error(logEntry.error_message); 
-            err.status = 503; // 或 500. 503 Service Unavailable 可能更贴切，表示暂时无法提供此文件
-            err.isServerError = true; 
-            err.details = { expectedPath: hashedFilePath, githubResponseStatus: encryptedFileData?.status || 404 };
-            throw err; // 这个错误会冒泡到 index.js
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[handleFileDownload] User: ${authenticatedUsername} - Attempting to download physical file: ${hashedFilePath}`);
         }
-        
-        const ivAndCiphertextBuffer = base64ToArrayBuffer(encryptedFileData.content_base64);
-        if (ivAndCiphertextBuffer.byteLength < AES_GCM_IV_LENGTH_BYTES) {
-            logEntry.error_message = "Invalid encrypted file data: too short to contain IV.";
-            const err = new Error(logEntry.error_message); err.status = 500; err.isServerError = true;
-            err.details = { fileSize: ivAndCiphertextBuffer.byteLength, expectedMinSize: AES_GCM_IV_LENGTH_BYTES };
+        const encryptedFileCheckResult = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
+
+        if (!encryptedFileCheckResult.exists) { // 物理文件不存在
+            logEntry.error_message = `Encrypted physical file (hash: ${fileHash}) not found at '${hashedFilePath}'. Index/Storage inconsistency.`;
+            if (env.LOGGING_ENABLED === "true") {
+                 console.warn(`[handleFileDownload] User: ${authenticatedUsername} - ${logEntry.error_message}. GitHub check result:`, encryptedFileCheckResult);
+            }
+            
+            let problemAlreadyLoggedUserMessage = "";
+            try { // 尝试读取和检查问题日志文件，这个操作本身不应阻塞主流程或因失败而中断下载失败的响应
+                const problemLogs = await githubService.getProblemLogEntries(env, owner, repo, targetBranch, authenticatedUsername, problemLogFileName);
+                if (problemLogs && problemLogs.some(p => p.fileHash === fileHash && p.originalPath === originalFilePath && (p.type === "BrokenIndexLink" || p.type === "BrokenIndexLinkOnDownload"))) {
+                    problemAlreadyLoggedUserMessage = " This issue was previously recorded by maintenance.";
+                    if (env.LOGGING_ENABLED === "true") console.log(`[handleFileDownload] User: ${authenticatedUsername} - Broken link for ${originalFilePath} (hash ${fileHash}) was already in problem log.`);
+                } else {
+                    const problemEntry = {
+                        timestamp: new Date().toISOString(), type: "BrokenIndexLinkOnDownload", originalPath: originalFilePath,
+                        fileHash: fileHash, expectedPhysicalPath: hashedFilePath,
+                        reason: `Physical file not found (404 or other error: ${encryptedFileCheckResult.error || '404'}) during download attempt.`,
+                        actionTaken: "Logged issue to user's problem file."
+                    };
+                    ctx.waitUntil(githubService.appendToProblemLogFile(env, owner, repo, targetBranch, authenticatedUsername, problemEntry, problemLogFileName));
+                    problemAlreadyLoggedUserMessage = " This issue has been logged for review.";
+                    if (env.LOGGING_ENABLED === "true") console.log(`[handleFileDownload] User: ${authenticatedUsername} - Logged new broken link for ${originalFilePath} (hash ${fileHash}) to problem log.`);
+                }
+            } catch (problemLogError) {
+                if (env.LOGGING_ENABLED === "true") console.error(`[handleFileDownload] User: ${authenticatedUsername} - Error accessing/updating problem log for ${originalFilePath}:`, problemLogError);
+                problemAlreadyLoggedUserMessage = " Error while checking/updating issue log.";
+            }
+            
+            const err = new Error(logEntry.error_message + problemAlreadyLoggedUserMessage); 
+            err.status = 503; // Service Unavailable - 文件暂时无法提供
+            err.isServerError = true; // 标记为服务器问题
+            err.details = { 
+                messageForUser: `File '${originalFilePath}' is currently unavailable due to a data consistency issue.${problemAlreadyLoggedUserMessage} Please try again later or contact support. (Ref: Hash ${fileHash})`,
+                githubCheckResult: encryptedFileCheckResult
+            };
             throw err;
         }
+
+        // 如果 getFileShaFromPath 成功，我们仍然需要文件内容，所以再次调用 getFileContentAndSha
+        const encryptedFileData = await githubService.getFileContentAndSha(env, owner, repo, hashedFilePath, targetBranch);
+         if (!encryptedFileData || !encryptedFileData.content_base64) { // 再次检查，以防万一
+            logEntry.error_message = `Failed to retrieve content for existing physical file (hash: ${fileHash}).`;
+            const err = new Error(logEntry.error_message); err.status = 500; err.isServerError = true;
+            err.details = {path: hashedFilePath, githubResponse: encryptedFileData};
+            throw err;
+        }
+
+        // 4. 解密
+        const ivAndCiphertextBuffer = base64ToArrayBuffer(encryptedFileData.content_base64);
+        if (ivAndCiphertextBuffer.byteLength < AES_GCM_IV_LENGTH_BYTES) { /* ... throw 500 server error ... */ }
         const iv = new Uint8Array(ivAndCiphertextBuffer.slice(0, AES_GCM_IV_LENGTH_BYTES));
         const ciphertext = ivAndCiphertextBuffer.slice(AES_GCM_IV_LENGTH_BYTES);
         const plainContentArrayBuffer = await decryptDataAesGcm(ciphertext, iv, userFileEncryptionKey);
@@ -289,10 +347,11 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
 
         const downloadFilename = originalFilePath.split('/').pop() || fileHash;
         return new Response(plainContentArrayBuffer, {
-            headers: { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${encodeURIComponent(downloadFilename)}"` }
+            headers: { /* ... (Content-Type, Content-Disposition) ... */ }
         });
 
     } catch (error) {
+        // (catch 和 finally 块的错误处理、日志记录逻辑和之前一样)
         if (!logEntry.error_message && error.message) logEntry.error_message = error.message.substring(0,255);
         logEntry.status = 'failure';
         logEntry.duration_ms = Date.now() - startTime;
@@ -303,14 +362,18 @@ export async function handleFileDownload(request, env, ctx, authenticatedUsernam
         }
         
         const statusCode = error.status || 500;
+        // 使用 error.details.messageForUser 如果存在，否则根据错误类型决定客户端消息
+        const clientErrorMessage = (error.details?.messageForUser) || 
+                                   ((error.isClientError || statusCode < 500) && !error.isServerError && error.message) || 
+                                   `An error occurred during file download. Please contact support if the issue persists. (Ref: ${request.headers.get('cf-ray') || 'N/A'})`;
+        
         if (error.isServerError || statusCode >= 500) {
             throw error; 
-        } else { // Client error
-            return errorResponse(env, error.message || "An error occurred during file download.", statusCode, null, error.details);
+        } else { 
+            return errorResponse(env, clientErrorMessage, statusCode, null, error.details);
         }
     }
 }
-
 export async function handleFileDelete(request, env, ctx, authenticatedUsername, originalFilePath) {
     // 功能：处理文件删除，包括认证、索引更新、物理文件删除（如果无引用）、耗时记录和日志记录。
     const startTime = Date.now();

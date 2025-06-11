@@ -333,3 +333,96 @@ export async function listDirectoryContents(env, owner, repo, dirPath, branch) {
     return { files: responseData, error: null, status: 200 };
 }
 
+
+/**
+ * 追加一条记录到用户的问题索引条目日志文件 (e.g., _problematic_index_entries.jsonl)。
+ * 如果文件不存在，则创建它。
+ * @param {object} env
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} branch
+ * @param {string} username
+ * @param {object} problemEntry - 例如 { timestamp, originalPath, fileHash, reason }
+ * @param {string} problemFileName - 例如 "_problematic_index_entries.jsonl"
+ * @returns {Promise<boolean>} 是否成功
+ */
+export async function appendToProblemLogFile(env, owner, repo, branch, username, problemEntry, problemFileName = "_problematic_index_entries.jsonl") {
+    // 功能：将问题条目追加到用户特定的日志文件中。
+    // 参数：env, owner, repo, branch, username, problemEntry, problemFileName
+    // 返回：Promise<boolean> - 操作是否成功。
+    const logFilePath = `${username}/${problemFileName}`;
+    const newLogLine = JSON.stringify(problemEntry); // 每个问题条目是一行 JSON
+
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[GitHubService] Appending to problem log: ${logFilePath} - Entry: ${newLogLine.substring(0,100)}`);
+    }
+
+    // 1. 获取现有日志文件内容和 SHA
+    const existingLogFile = await getFileContentAndSha(env, owner, repo, logFilePath, branch);
+    let newContentBase64;
+    let existingSha = null;
+
+    if (existingLogFile && existingLogFile.content_base64) {
+        existingSha = existingLogFile.sha;
+        try {
+            const decodedOldContent = new TextDecoder().decode(base64ToArrayBuffer(existingLogFile.content_base64));
+            const updatedContent = decodedOldContent.trim() === '' ? newLogLine : `${decodedOldContent.trim()}\n${newLogLine}`;
+            newContentBase64 = arrayBufferToBase64(new TextEncoder().encode(updatedContent));
+        } catch (e) {
+            if (env.LOGGING_ENABLED === "true") console.error(`[GitHubService] Error decoding existing problem log ${logFilePath}: ${e.message}. Overwriting with new entry.`);
+            // 如果解码失败（例如文件损坏），就用新条目覆盖它
+            newContentBase64 = arrayBufferToBase64(new TextEncoder().encode(newLogLine));
+            // 不传递 existingSha 意味着如果文件损坏则覆盖它（可能丢失旧日志）
+            // 或者，可以决定在这种情况下创建一个带时间戳的新文件以避免数据丢失
+            existingSha = null; // 强制创建/覆盖如果解析失败
+        }
+    } else {
+        // 文件不存在或内容为空，直接使用新日志行
+        newContentBase64 = arrayBufferToBase64(new TextEncoder().encode(newLogLine));
+    }
+
+    // 2. 创建或更新日志文件
+    const commitMessage = `Log: Add problematic index entry for user ${username}`;
+    const result = await createFileOrUpdateFile(env, owner, repo, logFilePath, branch, newContentBase64, commitMessage, existingSha);
+
+    if (result && !result.error) {
+        if (env.LOGGING_ENABLED === "true") console.log(`[GitHubService] Successfully appended to problem log: ${logFilePath}`);
+        return true;
+    } else {
+        if (env.LOGGING_ENABLED === "true") console.error(`[GitHubService] Failed to append to problem log ${logFilePath}:`, result?.message, result?.details);
+        return false;
+    }
+}
+
+/**
+ * 获取用户的问题索引条目日志内容。
+ * @param {object} env
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} branch
+ * @param {string} username
+ * @param {string} problemFileName - 例如 "_problematic_index_entries.jsonl"
+ * @returns {Promise<Array<object>|null>} 解析后的问题条目数组，或 null 如果失败/文件不存在。
+ */
+export async function getProblemLogEntries(env, owner, repo, branch, username, problemFileName = "_problematic_index_entries.jsonl") {
+    // 功能：获取并解析用户的问题日志文件内容。
+    // 参数：env, owner, repo, branch, username, problemFileName
+    // 返回：Promise<Array<object>|null> - 问题条目数组或 null。
+    const logFilePath = `${username}/${problemFileName}`;
+    const logFile = await getFileContentAndSha(env, owner, repo, logFilePath, branch);
+
+    if (logFile && logFile.content_base64) {
+        try {
+            const decodedContent = new TextDecoder().decode(base64ToArrayBuffer(logFile.content_base64));
+            const lines = decodedContent.trim().split('\n');
+            return lines.map(line => JSON.parse(line)).filter(entry => entry); // 解析每一行并过滤空条目
+        } catch (e) {
+            if (env.LOGGING_ENABLED === "true") console.error(`[GitHubService] Error parsing problem log file ${logFilePath}: ${e.message}`);
+            return null; // 解析失败
+        }
+    }
+    return null; // 文件不存在或内容为空
+}
+
+
+
