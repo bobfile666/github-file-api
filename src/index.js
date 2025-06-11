@@ -462,7 +462,7 @@ async function performMaintenanceChecks(event, env) {
     // 功能：定时执行数据一致性检查，包括：
     // 1. 检查用户的 index.json 文件是否存在及是否可解析。
     // 2. 检查 index.json 中的条目对应的物理哈希文件是否存在于 GitHub (检测损坏的索引链接)。
-    // 3. (可选，较复杂) 检测用户目录下是否存在未被 index.json 引用的孤立物理哈希文件。
+    // 3. 检测用户目录下是否存在未被 index.json 引用的孤立物理哈希文件。
     // 4. 将检测到的问题记录到用户特定的问题日志文件。
     // 5. 对于损坏的索引链接，从内存中的索引副本中移除这些条目，并尝试更新 GitHub 上的 index.json。
     // 6. 对于孤立的物理文件，将其移动到用户目录下的特定隔离文件夹。
@@ -494,210 +494,197 @@ async function performMaintenanceChecks(event, env) {
     if (!env.DB) {
         reportContent += `- Maintenance checks skipped (D1 DB not configured).\n`;
         if (env.LOGGING_ENABLED === "true") console.warn("[MaintenanceTask] D1 DB not configured. Skipping user-based checks.");
-        // (这里可以提前推送一个简化的报告，说明 DB 未配置)
-        // ... (推送简化报告的逻辑) ...
-        return; // 提前退出，因为后续操作依赖 D1
+        // 如果需要，可以在这里提前推送一个简化的报告
+        // ...
+        return; 
     }
 
+    let activeUsers = [];
     try {
         // 从 D1 获取所有活跃用户列表
         const usersStmt = env.DB.prepare("SELECT user_id FROM Users WHERE status = 'active'");
-        const { results: activeUsers, error: dbQueryError } = await usersStmt.all();
+        const { results, error: dbQueryError } = await usersStmt.all();
+        if (dbQueryError) throw dbQueryError; // 如果查询用户列表失败，直接抛出给外层 catch 处理
+        activeUsers = results || [];
 
-        if (dbQueryError) {
-            throw dbQueryError; // 如果查询用户列表失败，直接抛出给外层 catch 处理
-        }
-        
-        if (!activeUsers || activeUsers.length === 0) {
-            reportContent += `- No active users found in database to check.\n`;
-        } else {
-            reportContent += `Attempting to check ${activeUsers.length} active users...\n\n`;
-            for (const user of activeUsers) {
-                usersCheckedCount++;
-                let userHasIssuesThisRun = false; // 标记当前用户在此次运行中是否发现问题
-                let userIndexWasModified = false; // 标记当前用户的索引是否在内存中被修改
-                if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] Checking user: ${user.user_id}`);
-                
-                const userDirPath = `${user.user_id}/`;
-                const userOrphanedDirPath = `${userDirPath}${orphanedFilesBaseDir}`;
-                let currentLocalIndexData = { files: {} }; // 当前用户索引的内存副本
-                let currentIndexSha = null; // 当前用户索引文件在 GitHub 上的 SHA
+    } catch (dbError) {
+        reportContent += `- Error fetching users from D1: ${dbError.message}. Maintenance checks aborted.\n`;
+        if (env.LOGGING_ENABLED === "true") console.error("[MaintenanceTask] D1 Error during user query:", dbError.message, dbError.stack);
+        await logErrorToGitHub(env, 'MaintenanceDbError', dbError, `Cron: ${event.cron} - Failed to query users`);
+        // 在这里推送包含错误的报告，然后退出
+        // ... (报告推送逻辑) ...
+        return;
+    }
+    
+    if (activeUsers.length === 0) {
+        reportContent += `- No active users found in database to check.\n`;
+    } else {
+        reportContent += `Attempting to check ${activeUsers.length} active users...\n\n`;
+        for (const user of activeUsers) {
+            usersCheckedCount++;
+            let userHasIssuesThisRun = false; 
+            let userIndexWasModified = false; 
+            if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] --- Checking user: ${user.user_id} ---`);
+            
+            const userDirPath = `${user.user_id}/`;
+            const userOrphanedDirPath = `${userDirPath}${orphanedFilesBaseDir}`;
 
-                try {
-                    // --- 2.1 获取并验证用户索引文件 ---
-                    const indexPath = `${userDirPath}index.json`;
-                    const indexFileCheckResult = await githubService.getFileShaFromPath(env, owner, repo, indexPath, targetBranch);
+            try {
+                // --- 2.1 获取用户索引 ---
+                const indexPath = `${userDirPath}index.json`;
+                const indexFileCheckResult = await githubService.getFileShaFromPath(env, owner, repo, indexPath, targetBranch);
+                let originalIndexData = { files: {} };
+                let originalIndexSha = null;
+                let hasValidIndexToProcess = false;
 
-                    if (!indexFileCheckResult.exists) {
-                        if (indexFileCheckResult.error) { // 获取索引文件元数据时出错 (非 404)
-                            const issue = `User '${user.user_id}': ERROR checking index.json at '${indexPath}' - ${indexFileCheckResult.error} (Status: ${indexFileCheckResult.status}).`;
-                            issuesFoundDetails.push({ type: "IndexAccessError", user: user.user_id, path: indexPath, details: issue });
-                            userHasIssuesThisRun = true;
-                        } else { // 明确是 404，索引文件不存在
-                            const issue = `User '${user.user_id}': index.json NOT FOUND at '${indexPath}'.`;
-                            issuesFoundDetails.push({ type: "MissingIndexFile", user: user.user_id, path: indexPath, details: issue });
-                            userHasIssuesThisRun = true;
-                        }
-                        // 即使索引文件有问题，仍然可以继续检查该用户目录下的孤立文件
-                    } else { // 索引文件存在，尝试加载
-                        const indexResult = await getUserIndexForScheduledTask(env, user.user_id); // 使用为计划任务准备的 getUserIndex
-                        if (indexResult.error) { // 索引文件存在但解析失败
-                            const issue = `User '${user.user_id}': Error processing/parsing index.json at '${indexPath}' - ${indexResult.error}.`;
-                            issuesFoundDetails.push({ type: "CorruptedIndexFile", user: user.user_id, path: indexPath, details: issue });
-                            userHasIssuesThisRun = true;
-                            // 即使索引损坏，也使用一个空索引用来进行后续的孤立文件检查
-                            // currentLocalIndexData 默认为 { files: {} }
-                            currentIndexSha = indexFileCheckResult.sha; // 保存损坏索引的 SHA，以便后续可能覆盖
-                        } else {
-                            currentLocalIndexData = indexResult.indexData; // 加载成功
-                            currentIndexSha = indexResult.sha; // 保存当前索引的 SHA
-                        }
-                    }
-
-                    const filesToProcessInIndex = { ...(currentLocalIndexData.files || {}) }; // 克隆一份用于迭代和修改
-
-                    // --- 2.2 检查索引中的条目是否指向存在的物理文件 (Broken Index Links) ---
-                    if (Object.keys(filesToProcessInIndex).length > 0) {
-                         if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Index loaded/processed. Checking ${Object.keys(filesToProcessInIndex).length} file entries for broken links.`);
-                        for (const originalPath in filesToProcessInIndex) {
-                            const fileHash = filesToProcessInIndex[originalPath];
-                            if (!fileHash || typeof fileHash !== 'string' || fileHash.length < 32) { // 基本的哈希有效性检查
-                                const issue = `User '${user.user_id}': Index entry '${originalPath}' has INVALID HASH '${fileHash}'. Expected valid hash. Removing entry.`;
-                                issuesFoundDetails.push({ type: "InvalidHashInIndex", user: user.user_id, originalPath, fileHash, details: issue });
-                                userHasIssuesThisRun = true;
-                                // 从内存副本中删除无效条目
-                                delete currentLocalIndexData.files[originalPath];
-                                userIndexWasModified = true;
-                                brokenLinksCleanedCount++;
-                                if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
-                                continue; // 跳过此条目的物理文件检查
-                            }
-
-                            const hashedFilePath = `${userDirPath}${fileHash}`;
-                            const physicalFileCheck = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
-                            
-                            if (!physicalFileCheck.exists) { // 物理文件不存在 (损坏的链接)
-                                userHasIssuesThisRun = true;
-                                const reason = physicalFileCheck.error ? 
-                                    `ERROR checking physical file '${hashedFilePath}': ${physicalFileCheck.error} (Status: ${physicalFileCheck.status})` :
-                                    `MISSING physical file '${hashedFilePath}' (404).`;
-                                const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) points to ${reason}`;
-                                issuesFoundDetails.push({ type: "BrokenIndexLinkDetected", user: user.user_id, originalPath, fileHash, physicalPath: hashedFilePath, details: issue });
-                                if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
-
-                                // 1. 记录到用户的问题日志文件
-                                const problemEntry = {
-                                    timestamp: reportTimestampISO, type: "BrokenIndexLink", originalPath: originalPath,
-                                    fileHash: fileHash, expectedPhysicalPath: hashedFilePath, reason: reason,
-                                    actionTaken: "Entry removed from index.json during maintenance."
-                                };
-                                await githubService.appendToProblemLogFile(env, owner, repo, targetBranch, user.user_id, problemEntry, problemLogFileName);
-
-                                // 2. 从当前内存的 currentLocalIndexData.files 中移除这个错误的条目
-                                if (currentLocalIndexData.files && currentLocalIndexData.files[originalPath]) {
-                                    delete currentLocalIndexData.files[originalPath];
-                                    userIndexWasModified = true; 
-                                    brokenLinksCleanedCount++;
-                                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Removed broken link for '${originalPath}' from in-memory index.`);
-                                }
-                            }
-                        } // end for (originalPath in filesToProcessInIndex)
-                    } // end if (Object.keys(filesToProcessInIndex).length > 0)
-
-                    // --- 2.3 检查孤立的物理文件 ---
-                    const finalIndexedHashes = new Set(Object.values(currentLocalIndexData.files || {}));
-                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Checking for orphaned files in '${userDirPath}'. Known hashes: ${finalIndexedHashes.size}`);
-                    const dirContentsResult = await githubService.listDirectoryContents(env, owner, repo, userDirPath, targetBranch);
-
-                    if (dirContentsResult.error) {
-                        const issue = `User '${user.user_id}': Could not list contents of directory '${userDirPath}' to check for orphans. Error: ${dirContentsResult.error} (Status: ${dirContentsResult.status})`;
-                        issuesFoundDetails.push({ type: "DirectoryListError", user: user.user_id, path: userDirPath, details: issue });
+                if (!indexFileCheckResult.exists) {
+                    if (indexFileCheckResult.error && indexFileCheckResult.status !== 404) {
+                        const issue = `User '${user.user_id}': ERROR checking index.json at '${indexPath}' - ${indexFileCheckResult.error} (Status: ${indexFileCheckResult.status}).`;
+                        issuesFoundDetails.push({ type: "IndexAccessError", user: user.user_id, path: indexPath, details: issue });
                         userHasIssuesThisRun = true;
-                        if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`);
-                    } else if (dirContentsResult.files && dirContentsResult.files.length > 0) {
-                        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Found ${dirContentsResult.files.length} items in user directory.`);
-                        for (const item of dirContentsResult.files) {
-                            if (item.type === 'file' && item.name !== 'index.json' && !item.path.includes(orphanedFilesBaseDir)) { // 排除索引和已隔离的
-                                if (!finalIndexedHashes.has(item.name)) { // item.name 就是哈希文件名
-                                    const orphanedFilePath = item.path; 
-                                    const newOrphanedPath = `${userOrphanedDirPath}${item.name}`;
-                                    
-                                    const issue = `User '${user.user_id}': ORPHANED physical file found: '${orphanedFilePath}'. Not in (cleaned) index.json.`;
-                                    issuesFoundDetails.push({ type: "OrphanedFileDetected", user: user.user_id, physicalPath: orphanedFilePath, details: `${issue} Attempting to move to '${newOrphanedPath}'.` });
-                                    userHasIssuesThisRun = true;
-                                    if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
+                    } else { 
+                        const issue = `User '${user.user_id}': index.json NOT FOUND at '${indexPath}'.`;
+                        issuesFoundDetails.push({ type: "MissingIndexFile", user: user.user_id, path: indexPath, details: issue });
+                        userHasIssuesThisRun = true;
+                    }
+                } else {
+                    const indexResult = await getUserIndexForScheduledTask(env, user.user_id);
+                    if (indexResult.error) {
+                        const issue = `User '${user.user_id}': Error processing/parsing index.json at '${indexPath}' - ${indexResult.error.message}.`;
+                        issuesFoundDetails.push({ type: "CorruptedIndexFile", user: user.user_id, path: indexPath, details: issue });
+                        userHasIssuesThisRun = true;
+                        originalIndexSha = indexResult.sha; // 保存损坏索引的 SHA 以便覆盖
+                    } else {
+                        originalIndexData = indexResult.indexData;
+                        originalIndexSha = indexResult.sha;
+                        hasValidIndexToProcess = true;
+                    }
+                }
 
-                                    // 移动孤立文件
-                                    const moved = await moveGitHubFile(
-                                        env, owner, repo, targetBranch,
-                                        orphanedFilePath, newOrphanedPath,
-                                        `Maintenance: Quarantine orphaned file for user ${user.user_id}`
-                                    );
-                                    if (moved) {
-                                        filesMovedCount++;
-                                        issuesFoundDetails.push({ type: "OrphanedFileMoved", user: user.user_id, oldPath: orphanedFilePath, newPath: newOrphanedPath, details: "Successfully moved to orphaned files directory."});
-                                        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Orphaned file '${orphanedFilePath}' moved to '${newOrphanedPath}'.`);
-                                    } else {
-                                        issuesFoundDetails.push({ type: "OrphanedFileMoveFailed", user: user.user_id, physicalPath: orphanedFilePath, details: `Failed to move orphaned file '${orphanedFilePath}' to quarantine.` });
-                                        if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] User ${user.user_id}: FAILED to move orphaned file '${orphanedFilePath}'.`);
-                                    }
+                // --- 新的、更安全的处理逻辑 ---
+                const goodIndexEntries = {}; // 用于存放所有验证通过的“好”记录
+                const processedHashes = new Set(); // 存放所有在原始 index.json 中提到并处理过的哈希
+
+                if (hasValidIndexToProcess && originalIndexData.files) {
+                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Verifying ${Object.keys(originalIndexData.files).length} entries from index.`);
+                    for (const originalPath in originalIndexData.files) {
+                        const fileHash = originalIndexData.files[originalPath];
+                        processedHashes.add(fileHash); 
+
+                        if (!fileHash || typeof fileHash !== 'string' || fileHash.length < 32) {
+                            const issue = `User '${user.user_id}': Index entry '${originalPath}' has INVALID HASH '${fileHash}'. This entry will be dropped.`;
+                            issuesFoundDetails.push({ type: "InvalidHashInIndex", user: user.user_id, originalPath, fileHash, details: issue });
+                            userHasIssuesThisRun = true;
+                            userIndexWasModified = true;
+                            brokenLinksCleanedCount++;
+                             if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
+                            continue;
+                        }
+
+                        const hashedFilePath = `${userDirPath}${fileHash}`;
+                        const physicalFileCheck = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
+                        
+                        if (physicalFileCheck.exists) {
+                            goodIndexEntries[originalPath] = fileHash; // 物理文件存在，是“好”记录
+                        } else {
+                            userHasIssuesThisRun = true;
+                            userIndexWasModified = true;
+                            brokenLinksCleanedCount++;
+                            const reason = physicalFileCheck.error ? `ERROR checking physical file: ${physicalFileCheck.error}` : `MISSING physical file (404).`;
+                            const issue = `User '${user.user_id}': Index entry '${originalPath}' (hash: ${fileHash}) points to ${reason} This entry will be removed.`;
+                            issuesFoundDetails.push({ type: "BrokenIndexLinkCleaned", user: user.user_id, originalPath, fileHash, physicalPath: hashedFilePath, details: issue });
+                            if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
+                            
+                            const problemEntry = {
+                                timestamp: reportTimestampISO, type: "BrokenIndexLink", originalPath: originalPath,
+                                fileHash: fileHash, expectedPhysicalPath: hashedFilePath, reason: reason,
+                                actionTaken: "Entry removed from index.json during maintenance."
+                            };
+                            await githubService.appendToProblemLogFile(env, owner, repo, targetBranch, user.user_id, problemEntry, problemLogFileName);
+                        }
+                    }
+                }
+
+                // ---- 检查完一个用户的所有索引条目后，如果索引被修改了，则更新GitHub上的index.json ----
+                if (userIndexWasModified && originalIndexSha) { 
+                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Index was modified in memory. Attempting to update index.json on GitHub (Original SHA: ${originalIndexSha}).`);
+                    const newIndexData = { files: goodIndexEntries };
+                    const updateCommitMessage = `Maintenance: Cleaned ${brokenLinksCleanedCount} broken link(s) from index for user ${user.user_id}`;
+                    try {
+                        await updateUserIndex(env, user.user_id, newIndexData, originalIndexSha, targetBranch, updateCommitMessage);
+                        if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: index.json updated successfully after cleaning.`);
+                    } catch (indexUpdateError) {
+                        const issue = `User '${user.user_id}': FAILED to update index.json on GitHub after cleaning. Error: ${indexUpdateError.message}`;
+                        issuesFoundDetails.push({ type: "IndexUpdateAfterCleanFail", user: user.user_id, details: issue });
+                        userHasIssuesThisRun = true; 
+                        if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`, indexUpdateError.details || indexUpdateError);
+                        await logErrorToGitHub(env, 'MaintenanceIndexUpdateFail', indexUpdateError, `User: ${user.user_id}, Cron: ${event.cron}`);
+                    }
+                } else if (userIndexWasModified) {
+                    if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] User ${user.user_id}: Index was modified in memory, but original index did not exist or had no valid SHA to update. A new index will be created on next user upload.`);
+                } else if (env.LOGGING_ENABLED === "true") {
+                    console.log(`[MaintenanceTask] User ${user.user_id}: Index is clean, no update needed.`)
+                }
+
+
+                // --- 检查孤立的物理文件 ---
+                if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Checking for orphaned files in '${userDirPath}'.`);
+                const dirContentsResult = await githubService.listDirectoryContents(env, owner, repo, userDirPath, targetBranch);
+
+                if (dirContentsResult.error) {
+                     const issue = `User '${user.user_id}': Could not list contents of directory '${userDirPath}' to check for orphans. Error: ${dirContentsResult.error} (Status: ${dirContentsResult.status})`;
+                     issuesFoundDetails.push({ type: "DirectoryListError", user: user.user_id, path: userDirPath, details: issue });
+                     userHasIssuesThisRun = true;
+                     if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`);
+                } else if (dirContentsResult.files && dirContentsResult.files.length > 0) {
+                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Found ${dirContentsResult.files.length} items in user directory.`);
+                    for (const item of dirContentsResult.files) {
+                        if (item.type === 'file' && item.name !== 'index.json' && item.name !== problemLogFileName && !item.path.includes(orphanedFilesBaseDir)) {
+                            if (!processedHashes.has(item.name)) {
+                                userHasIssuesThisRun = true;
+                                const orphanedFilePath = item.path;
+                                const newOrphanedPath = `${userOrphanedDirPath}${item.name}`;
+                                const issue = `User '${user.user_id}': ORPHANED physical file found: '${orphanedFilePath}'. Not in original index.json.`;
+                                issuesFoundDetails.push({ type: "OrphanedFileDetected", user: user.user_id, physicalPath: orphanedFilePath, details: `${issue} Attempting to move.` });
+                                if (env.LOGGING_ENABLED === "true") console.warn(`[MaintenanceTask] ${issue}`);
+                                
+                                const moved = await moveGitHubFile(env, owner, repo, targetBranch, orphanedFilePath, newOrphanedPath, `Maintenance: Quarantine orphaned file for ${user.user_id}`);
+                                if (moved) {
+                                    filesMovedCount++;
+                                    issuesFoundDetails.push({ type: "OrphanedFileMoved", user: user.user_id, oldPath: orphanedFilePath, newPath: newOrphanedPath, details: "Successfully moved to orphaned files directory."});
+                                    if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Orphaned file '${orphanedFilePath}' moved to '${newOrphanedPath}'.`);
+                                } else {
+                                    issuesFoundDetails.push({ type: "OrphanedFileMoveFailed", user: user.user_id, physicalPath: orphanedFilePath, details: `Failed to move orphaned file '${orphanedFilePath}' to quarantine.` });
+                                    if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] User ${user.user_id}: FAILED to move orphaned file '${orphanedFilePath}'.`);
                                 }
                             }
                         }
                     }
-
-                    // ---- 在处理完一个用户的所有检查后，如果索引被修改了，则更新 GitHub 上的 index.json ----
-                    if (userIndexWasModified) { 
-                        // 只有当索引文件存在 (currentIndexSha 不为 null) 或 索引文件损坏但我们想覆盖它 (indexFileCheckResult.exists 但 getUserIndexForScheduledTask 返回 error) 时才更新
-                        // 并且我们确实修改了内存中的 currentLocalIndexData.files
-                        if (currentIndexSha || (indexFileCheckResult.exists && (await getUserIndexForScheduledTask(env, user.user_id)).error) ) {
-                            if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: Index was modified in memory. Attempting to update index.json on GitHub (Original SHA: ${currentIndexSha || indexFileCheckResult.sha}).`);
-                            const updateCommitMessage = `Maintenance: Cleaned/updated index for user ${user.user_id}`;
-                            try {
-                                // 使用最新的 currentLocalIndexData (它包含了 files 属性)
-                                // 如果 currentIndexSha 为 null 但 indexFileCheckResult.sha 存在（例如，初始解析失败后清理），使用后者
-                                const shaForUpdate = currentIndexSha || (indexFileCheckResult.exists ? indexFileCheckResult.sha : null);
-                                await updateUserIndex(env, user.user_id, currentLocalIndexData, shaForUpdate, targetBranch, updateCommitMessage);
-                                if (env.LOGGING_ENABLED === "true") console.log(`[MaintenanceTask] User ${user.user_id}: index.json updated successfully after cleaning.`);
-                            } catch (indexUpdateError) {
-                                const issue = `User '${user.user_id}': FAILED to update index.json on GitHub after cleaning. Error: ${indexUpdateError.message}`;
-                                issuesFoundDetails.push({ type: "IndexUpdateAfterCleanFail", user: user.user_id, details: issue });
-                                userHasIssuesThisRun = true; 
-                                if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`, indexUpdateError.details || indexUpdateError);
-                                await logErrorToGitHub(env, 'MaintenanceIndexUpdateFail', indexUpdateError, `User: ${user.user_id}, Cron: ${event.cron}`);
-                            }
-                        } else if (env.LOGGING_ENABLED === "true") {
-                             console.log(`[MaintenanceTask] User ${user.user_id}: Index was modified in memory, but original index did not exist or no valid SHA to update. A new index might be created on next user upload if it was missing.`);
-                        }
-                    }
-
-                } catch (userCheckError) { 
-                    const issue = `User '${user.user_id}': UNEXPECTED CRITICAL ERROR during check - ${userCheckError.message}. Further checks for this user aborted.`;
-                    if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`, userCheckError.stack);
-                    issuesFoundDetails.push({ type: "UserCheckFailedCritical", user: user.user_id, details: issue, stack: userCheckError.stack });
-                    userHasIssuesThisRun = true; 
                 }
+
                 if (userHasIssuesThisRun) {
                     usersWithIssuesCount++;
                 }
-            } // end for (const user of activeUsers)
 
-            reportContent += `\n**Summary for this run:**\n`;
-            reportContent += `- Users Checked: ${usersCheckedCount}\n`;
-            reportContent += `- Users with Issues Detected/Actions Taken: ${usersWithIssuesCount}\n`;
-            reportContent += `- Broken Index Links Cleaned from index.json: ${brokenLinksCleanedCount}\n`;
-            reportContent += `- Orphaned Physical Files Moved to Quarantine: ${filesMovedCount}\n`;
-
-        } // end if (activeUsers && activeUsers.length > 0)
-    } catch (dbError) { // Error querying users from DB
-        reportContent += `- Error fetching users from D1: ${dbError.message}. Maintenance checks aborted.\n`;
-        if (env.LOGGING_ENABLED === "true") console.error("[MaintenanceTask] D1 Error during user query:", dbError);
-        await logErrorToGitHub(env, 'MaintenanceDbError', dbError, `Cron: ${event.cron} - Failed to query users`);
+            } catch (userCheckError) {
+                const issue = `User '${user.user_id}': UNEXPECTED CRITICAL ERROR during check - ${userCheckError.message}. Further checks for this user aborted.`;
+                if (env.LOGGING_ENABLED === "true") console.error(`[MaintenanceTask] ${issue}`, userCheckError.stack);
+                issuesFoundDetails.push({ type: "UserCheckFailedCritical", user: user.user_id, details: issue, stack: userCheckError.stack });
+                if (!userHasIssuesThisRun) usersWithIssuesCount++;
+            }
+        } // end for loop
     }
-    reportContent += `\n`;
-
+    
+    // --- 报告总结 ---
+    reportContent += `\n**Summary for this run:**\n`;
+    reportContent += `- Users Checked: ${usersCheckedCount}\n`;
+    reportContent += `- Users with Issues/Actions: ${usersWithIssuesCount}\n`;
+    reportContent += `- Broken Index Links Cleaned: ${brokenLinksCleanedCount}\n`;
+    reportContent += `- Orphaned Physical Files Moved: ${filesMovedCount}\n`;
+    
+    // --- 详细问题列表 ---
     if (issuesFoundDetails.length > 0) {
-        reportContent += `## Detailed Issues and Actions Log (${issuesFoundDetails.length}):\n`;
+        reportContent += `\n## Detailed Issues and Actions Log (${issuesFoundDetails.length}):\n`;
         issuesFoundDetails.forEach(issue => { 
             reportContent += `### Type: ${issue.type}\n`;
             reportContent += `- User: \`${issue.user}\`\n`;
@@ -710,23 +697,20 @@ async function performMaintenanceChecks(event, env) {
             reportContent += `- Details: ${issue.details}\n\n`;
         });
     } else if (usersCheckedCount > 0) {
-        reportContent += `**No consistency issues found requiring action for ${usersCheckedCount} checked users.**\n`;
-    } else if (usersCheckedCount === 0 && (!activeUsers || activeUsers.length === 0)) {
-         reportContent += `**No active users found to perform checks on.**\n`;
+        reportContent += `\n**No consistency issues found requiring action for ${usersCheckedCount} checked users.**\n`;
     }
 
-
-    reportContent += `\n**Note**: This report provides outcomes of automated consistency checks. Orphaned files are moved to \`_orphaned_files/\` subdirectory within each user's folder. Broken links are removed from the live \`index.json\`. Manual review may be needed for complex or recurring issues.\n`;
+    reportContent += `\n**Note**: This report provides outcomes of automated consistency checks. Orphaned files are moved to \`_orphaned_files/\` subdirectory. Broken links are removed from the live \`index.json\`. Manual review may be needed for complex or recurring issues.\n`;
     
-    // --- 报告归档和推送逻辑 (和之前一样) ---
+    // --- 报告归档和推送逻辑 ---
+    // (和之前一样，确保 githubService 和 arrayBufferToBase64 可用)
     const reportRepoOwner = env.REPORT_REPO_OWNER || env.GITHUB_REPO_OWNER;
     const reportRepoName = env.REPORT_REPO_NAME || env.GITHUB_REPO_NAME;
     const reportRepoBranch = env.REPORT_REPO_BRANCH || env.TARGET_BRANCH || "main";
     const baseReportDir = env.MAINTENANCE_REPORT_PATH_PREFIX || "system_reports/maintenance/";
     const latestReportRelativePath = "latest_maintenance_report.md";
     const latestReportFullPath = `${baseReportDir.endsWith('/') ? baseReportDir : baseReportDir + '/'}${latestReportRelativePath}`;
-
-    // 归档
+    
     const previousReportData = await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch);
     if (previousReportData.exists && previousReportData.sha) {
         const archiveDate = new Date(reportTimestampDate.getTime() - (23 * 60 * 60 * 1000 + 59 * 60 * 1000) ); // 约 24 小时前
@@ -739,8 +723,7 @@ async function performMaintenanceChecks(event, env) {
         await moveGitHubFile(env, reportRepoOwner, reportRepoName, reportRepoBranch, latestReportFullPath, archivedReportFullPath, "Chore: Archive maintenance report");
     }
 
-    // 推送新报告
-    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent)); // 确保 arrayBufferToBase64 导入
+    const reportContentBase64 = arrayBufferToBase64(new TextEncoder().encode(reportContent));
     const commitMessage = `System Maintenance Report: ${reportTimestampISO} - Issues: ${issuesFoundDetails.length}`;
     const latestReportShaAfterArchiveAttempt = (await githubService.getFileShaFromPath(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch))?.sha;
     const pushResult = await githubService.createFileOrUpdateFile(env, reportRepoOwner, reportRepoName, latestReportFullPath, reportRepoBranch, reportContentBase64, commitMessage, latestReportShaAfterArchiveAttempt);
@@ -757,7 +740,6 @@ async function performMaintenanceChecks(event, env) {
         console.log(`[MaintenanceTask] Finished. Duration: ${duration}ms. Issues detailed: ${issuesFoundDetails.length}. Files moved: ${filesMovedCount}. Links cleaned: ${brokenLinksCleanedCount}.`);
     }
 }
-
 /**
  * 辅助函数：将 GitHub 上的文件移动/重命名 (通过复制和删除实现)
  * @param {object} env
