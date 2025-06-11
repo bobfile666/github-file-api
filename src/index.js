@@ -221,110 +221,6 @@ async function routeRequest(request, env, ctx) {
 }
 
 
-export default {
-    async fetch(request, env, ctx) {
-        // ... (开始的日志和 OPTIONS 处理) ...
-        let response;
-        const startTime = Date.now();
-        const rayId = request.headers.get('cf-ray') || `fetch-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
-
-        if (env && env.LOGGING_ENABLED === "true") {
-            console.log(`[IndexFetch] START: ${request.method} ${request.url} Ray: ${rayId}`);
-        }
-        if (request.method === 'OPTIONS') {
-            return handleOptions(request); // 确保 handleOptions 已定义
-        }
-
-
-        try {
-            response = await routeRequest(request, env, ctx); // routeRequest 现在是主要的请求处理器
-        } catch (err) { 
-            err.rayId = rayId; 
-            if (env.LOGGING_ENABLED === "true") {
-                console.error(`[IndexFetch CRITICAL] Unhandled error in routeRequest for ${request.method} ${request.url} (Ray ID: ${rayId}):`, err.message, err.stack, err);
-            }
-            
-            const isServerError = !err.status || (err.status >= 500 && err.status <= 599) || err.isServerError === true; // 添加对 isServerError 标志的检查
-            const isClientError = err.isClientError === true || (err.status && err.status >= 400 && err.status < 500);
-
-
-            if (isServerError && !isClientError) { // 只记录明确的服务器错误或未标记的5xx错误
-                ctx.waitUntil(logErrorToGitHub(env, 'GlobalFetchError', err, `${request.method} ${request.url}`));
-            }
-            
-            if (err instanceof Response) {
-                response = err; // 如果错误本身就是Response对象，直接用它
-            } else {
-                const responseStatus = (typeof err.status === 'number' && err.status >= 400 && err.status <= 599) ? err.status : 500;
-                let responseMessage = "An unexpected error occurred."; // 默认消息
-
-                if (responseStatus >= 500) {
-                    responseMessage = `Internal Server Error. Please contact support if the issue persists. Ray ID: ${rayId}`;
-                } else if (responseStatus === 404) {
-                    responseMessage = err.message || "The requested resource was not found."; // 使用原始错误消息或通用 404 消息
-                } else if (responseStatus === 401 || responseStatus === 403) {
-                    responseMessage = err.message || (responseStatus === 401 ? "Unauthorized." : "Forbidden.");
-                } else if (responseStatus >= 400 && responseStatus < 500) {
-                    responseMessage = err.message || "Bad Request."; // 其他4xx错误的通用消息
-                }
-                
-                response = errorResponse(env, responseMessage, responseStatus, "GLOBAL_ERROR", {originalErrorMessage: err.message});
-            }
-        } finally {
-            if (env && env.LOGGING_ENABLED === "true") {
-                const duration = Date.now() - startTime;
-                // 确保 response 对象存在才访问 response.status
-                const statusString = response ? response.status : 'N/A (no response generated)';
-                console.log(`[IndexFetch] END: ${request.method} ${request.url} Status: ${statusString} Duration: ${duration}ms Ray: ${rayId}`);
-            }
-        }
-        return response;
-    },
-
-
-    /**
-     * 新添加的函数：处理 Cron Trigger 调度的事件
-     * @param {ScheduledEvent} event - https://developers.cloudflare.com/workers/runtime-apis/scheduled-event/
-     * @param {object} env - Worker 环境变量
-     * @param {object} ctx - 执行上下文，包含 waitUntil
-     * @returns {Promise<void>}
-     */
-    async scheduled(event, env, ctx) {
-        // 功能：根据触发的 CRON 表达式分发到不同的计划任务处理器。
-        // (此函数的逻辑和之前一样，包含 switch(event.cron) 和调用任务函数)
-        if (env.LOGGING_ENABLED === "true") {
-            console.log(`[ScheduledHandler] START - Cron: '${event.cron}' at ${new Date(event.scheduledTime).toISOString()}`);
-        }
-        let taskPromise;
-        switch (event.cron) {
-            case "0 */2 * * *": 
-                taskPromise = generateAndPushStatusReport(event, env);
-                break;
-            case "0 3 * * *":   
-                taskPromise = performMaintenanceChecks(event, env);
-                break;
-            default:
-                if (env.LOGGING_ENABLED === "true") console.warn(`[ScheduledHandler] No task for cron: '${event.cron}'`);
-                return; 
-        }
-        if (taskPromise) {
-            ctx.waitUntil(
-                taskPromise
-                .then(() => {
-                    if (env.LOGGING_ENABLED === "true") console.log(`[ScheduledHandler] END - Successfully completed task for cron '${event.cron}'. Duration: ${Date.now() - startTime}ms`);
-                })
-                .catch(error => { // 捕获计划任务执行中的任何错误
-                    if (env.LOGGING_ENABLED === "true") console.error(`[ScheduledHandler CRITICAL] Error during scheduled task for cron '${event.cron}':`, error.message, error.stack);
-                    // 计划任务中的错误通常被认为是服务器端问题
-                    const errorToLog = error instanceof Error ? error : new Error(String(error));
-                    errorToLog.rayId = `scheduled-${event.cron}-${event.scheduledTime}`; // 构造一个唯一的 ID
-                    ctx.waitUntil(logErrorToGitHub(env, 'ScheduledTaskExecutionError', errorToLog, `Cron: ${event.cron}`));
-                })
-            );
-        }
-    }
-};
-
 // --- 辅助函数：用于 scheduled 任务的 getUserIndex (不依赖 HTTP 请求) ---
 // 注意：这个函数是 getUserIndex 的一个变体，或者 getUserIndex 本身就可以被这样调用。
 // 我们需要确保 githubService 和 base64ToArrayBuffer 在此作用域可用。
@@ -695,7 +591,129 @@ async function logErrorToGitHub(env, errorType, errorObject, additionalContext =
 }
 
 
+export default {
+    async fetch(request, env, ctx) {
+        // 功能：Worker 的主 fetch 处理函数。
+        const startTime = Date.now();
+        let response; 
+        const rayId = request.headers.get('cf-ray') || `fetch-${Date.now()}-${Math.random().toString(36).substring(2,7)}`;
 
+        if (env && env.LOGGING_ENABLED === "true") {
+            console.log(`[IndexFetch] START: ${request.method} ${request.url} Ray: ${rayId}`);
+        }
+        
+        if (request.method === 'OPTIONS') {
+            return handleOptions(request); // 确保 handleOptions 已定义
+        }
+
+        try {
+            response = await routeRequest(request, env, ctx); // routeRequest 是主要的请求处理器
+        } catch (err) { 
+            // 这个 catch 块处理从 routeRequest 或其调用的 handlers 中未被捕获而抛出的错误
+            err.rayId = rayId; // 附加 Ray ID 以便追踪
+
+            const isServerErrorLogTarget = err.isServerError || !err.isClientError; // 如果明确标记为服务器错误，或者没有明确标记为客户端错误，则认为是服务器问题需要记录
+                                                                                    // 或者更简单：只要 status >= 500 或者 isServerError 为 true
+            const effectiveStatus = (typeof err.status === 'number' && err.status >= 400 && err.status <= 599) ? err.status : 500;
+            const shouldLogErrorToGithub = err.isServerError === true || effectiveStatus >= 500;
+
+
+            if (env.LOGGING_ENABLED === "true") {
+                console.error(`[IndexFetch CRITICAL] Unhandled error in routing/handler for ${request.method} ${request.url} (Ray ID: ${rayId}):`, 
+                              `Message: ${err.message}`, 
+                              `Status: ${effectiveStatus}`, 
+                              `IsServerErrorFlag: ${err.isServerError}`,
+                              `IsClientErrorFlag: ${err.isClientError}`,
+                              err.stack, 
+                              err.details || err);
+            }
+            
+            if (shouldLogErrorToGithub) {
+                // 确保传递的是 Error 实例
+                const errorToLog = err instanceof Error ? err : new Error(String(err.message || err));
+                if (!errorToLog.stack && err.stack) errorToLog.stack = err.stack; // 补上 stack
+                if (!errorToLog.status && err.status) errorToLog.status = err.status; // 补上 status
+                if (err.details) errorToLog.details = err.details;
+
+                ctx.waitUntil(logErrorToGitHub(env, 'GlobalFetchUnhandledError', errorToLog, `${request.method} ${request.url}`));
+            }
+            
+            // 为客户端构造响应
+            let clientResponseMessage;
+            let clientResponseStatus = effectiveStatus; // 默认使用错误对象上的 status，或 500
+            let clientErrorCode = "UNEXPECTED_ERROR";
+
+            if (err.isClientError || (clientResponseStatus >= 400 && clientResponseStatus < 500 && !err.isServerError)) {
+                // 明确是客户端错误，或根据状态码判断（且未被标记为服务器错误）
+                clientResponseMessage = err.message || "A client-side error occurred.";
+                clientErrorCode = err.code || "CLIENT_REQUEST_ERROR";
+            } else {
+                // 认为是服务器端错误（或未明确分类的错误，默认为服务器端）
+                clientResponseMessage = `An internal server error occurred. Please try again later or contact support if the issue persists. Ray ID: ${rayId}`;
+                clientResponseStatus = effectiveStatus >= 500 ? effectiveStatus : 500; // 确保服务器错误至少是 500
+                clientErrorCode = err.code || "INTERNAL_SERVER_ERROR";
+            }
+            
+            // 如果原始错误就是一个 Response 对象 (例如从 errorResponse 返回的)，理论上不应该到这里，因为它不是被 throw 的 Error 实例
+            // 但为了安全，检查一下
+            if (err instanceof Response) {
+                 response = err;
+            } else {
+                response = errorResponse(env, clientResponseMessage, clientResponseStatus, clientErrorCode, { originalError: err.message, detailsForLog: err.details });
+            }
+        } finally {
+            if (env && env.LOGGING_ENABLED === "true") {
+                const duration = Date.now() - startTime;
+                const statusString = response ? response.status : 'N/A (no response generated)';
+                console.log(`[IndexFetch] END: ${request.method} ${request.url} Status: ${statusString} Duration: ${duration}ms Ray: ${rayId}`);
+            }
+        }
+        return response; // response 应该总是在 try 或 catch 中被赋值
+    },
+
+
+    /**
+     * 新添加的函数：处理 Cron Trigger 调度的事件
+     * @param {ScheduledEvent} event - https://developers.cloudflare.com/workers/runtime-apis/scheduled-event/
+     * @param {object} env - Worker 环境变量
+     * @param {object} ctx - 执行上下文，包含 waitUntil
+     * @returns {Promise<void>}
+     */
+    async scheduled(event, env, ctx) {
+        // 功能：根据触发的 CRON 表达式分发到不同的计划任务处理器。
+        // (此函数的逻辑和之前一样，包含 switch(event.cron) 和调用任务函数)
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[ScheduledHandler] START - Cron: '${event.cron}' at ${new Date(event.scheduledTime).toISOString()}`);
+        }
+        let taskPromise;
+        switch (event.cron) {
+            case "0 */2 * * *": 
+                taskPromise = generateAndPushStatusReport(event, env);
+                break;
+            case "0 3 * * *":   
+                taskPromise = performMaintenanceChecks(event, env);
+                break;
+            default:
+                if (env.LOGGING_ENABLED === "true") console.warn(`[ScheduledHandler] No task for cron: '${event.cron}'`);
+                return; 
+        }
+        if (taskPromise) {
+            ctx.waitUntil(
+                taskPromise
+                .then(() => {
+                    if (env.LOGGING_ENABLED === "true") console.log(`[ScheduledHandler] END - Successfully completed task for cron '${event.cron}'. Duration: ${Date.now() - startTime}ms`);
+                })
+                .catch(error => { // 捕获计划任务执行中的任何错误
+                    if (env.LOGGING_ENABLED === "true") console.error(`[ScheduledHandler CRITICAL] Error during scheduled task for cron '${event.cron}':`, error.message, error.stack);
+                    // 计划任务中的错误通常被认为是服务器端问题
+                    const errorToLog = error instanceof Error ? error : new Error(String(error));
+                    errorToLog.rayId = `scheduled-${event.cron}-${event.scheduledTime}`; // 构造一个唯一的 ID
+                    ctx.waitUntil(logErrorToGitHub(env, 'ScheduledTaskExecutionError', errorToLog, `Cron: ${event.cron}`));
+                })
+            );
+        }
+    }
+};
 
 
 
