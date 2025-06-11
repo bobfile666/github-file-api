@@ -270,9 +270,9 @@ async function getUserIndexForScheduledTask(env, username) {
  */
 async function generateAndPushStatusReport(event, env) {
     // 功能：生成关于用户统计和近期活动的报告，归档旧报告，并推送到 GitHub。
-    // (此函数的完整代码已在之前的回答中提供，包含报告内容生成和 GitHub 推送逻辑)
+    // 现在包括 24 小时内下载次数最多的文件统计。
     if (env.LOGGING_ENABLED === "true") {
-        console.log(`[StatusReportTask] Starting - Triggered by: ${event.cron}`);
+        console.log(`[StatusReportTask] Starting - Triggered by: ${event.cron} at ${new Date(event.scheduledTime).toISOString()}`);
     }
     const reportTimestampDate = new Date(event.scheduledTime);
     const reportTimestampISO = reportTimestampDate.toISOString();
@@ -292,42 +292,112 @@ async function generateAndPushStatusReport(event, env) {
         reportContent += `- User statistics unavailable (D1 DB not configured).\n\n`;
     }
 
-    // --- 近期活动 (例如过去 24 小时) ---
+    // --- 近期活动 (过去 24 小时) ---
     if (env.DB) {
         reportContent += `## Recent Activity Summary (Last 24 Hours)\n`;
         const activityTimeLimit = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        
         try {
-            // 成功活动
+            // 1. 按用户和操作类型统计成功次数及上传大小
             const successActivityStmt = env.DB.prepare(
                 "SELECT user_id, action_type, COUNT(*) as success_count, SUM(CASE WHEN action_type = 'upload' THEN file_size_bytes ELSE 0 END) as total_upload_size " +
-                "FROM FileActivityLogs WHERE logged_at >= ? AND status = 'success' GROUP BY user_id, action_type ORDER BY success_count DESC, total_upload_size DESC LIMIT 15"
+                "FROM FileActivityLogs " +
+                "WHERE logged_at >= ? AND status = 'success' " +
+                "GROUP BY user_id, action_type " +
+                "ORDER BY success_count DESC, total_upload_size DESC LIMIT 15"
             );
-            const { results: successActivities } = await successActivityStmt.bind(activityTimeLimit).all();
+            const { results: successActivities, error: sActError } = await successActivityStmt.bind(activityTimeLimit).all();
+            if (sActError) throw sActError; // 抛出给外层 try-catch
+
             if (successActivities && successActivities.length > 0) {
-                reportContent += `### Top Successful Activities:\n| User ID        | Action   | Success Count | Total Upload Size (Bytes) |\n|----------------|----------|---------------|---------------------------|\n`;
+                reportContent += `### Top Successful Activities by User/Action:\n`;
+                reportContent += `| User ID        | Action   | Success Count | Total Upload Size (Bytes) |\n`;
+                reportContent += `|----------------|----------|---------------|---------------------------|\n`;
                 successActivities.forEach(act => {
                     reportContent += `| ${act.user_id.padEnd(14)} | ${act.action_type.padEnd(8)} | ${String(act.success_count).padEnd(13)} | ${act.action_type === 'upload' ? String(act.total_upload_size || 0).padEnd(25) : 'N/A'.padEnd(25)} |\n`;
                 });
-            } else { reportContent += `- No successful activities recorded in the last 24 hours.\n`; }
+            } else {
+                reportContent += `- No successful activities recorded in the last 24 hours.\n`;
+            }
             reportContent += `\n`;
 
-            // 失败活动
+            // 2. 按用户和操作类型统计失败次数
             const failureActivityStmt = env.DB.prepare(
                 "SELECT user_id, action_type, COUNT(*) as failure_count, GROUP_CONCAT(DISTINCT SUBSTR(error_message, 1, 30)) as common_errors " +
-                "FROM FileActivityLogs WHERE logged_at >= ? AND status = 'failure' GROUP BY user_id, action_type ORDER BY failure_count DESC LIMIT 10"
+                "FROM FileActivityLogs " +
+                "WHERE logged_at >= ? AND status = 'failure' " +
+                "GROUP BY user_id, action_type " +
+                "ORDER BY failure_count DESC LIMIT 10"
             );
-            const { results: failureActivities } = await failureActivityStmt.bind(activityTimeLimit).all();
+            const { results: failureActivities, error: fActError } = await failureActivityStmt.bind(activityTimeLimit).all();
+            if (fActError) throw fActError;
+
             if (failureActivities && failureActivities.length > 0) {
-                reportContent += `### Top Failed Activities:\n| User ID        | Action   | Failure Count | Common Errors (truncated)    |\n|----------------|----------|---------------|------------------------------|\n`;
+                reportContent += `### Top Failed Activities by User/Action:\n`;
+                reportContent += `| User ID        | Action   | Failure Count | Common Errors (truncated)    |\n`;
+                reportContent += `|----------------|----------|---------------|------------------------------|\n`;
                 failureActivities.forEach(act => {
                     reportContent += `| ${act.user_id.padEnd(14)} | ${act.action_type.padEnd(8)} | ${String(act.failure_count).padEnd(13)} | ${(act.common_errors || 'N/A').padEnd(28)} |\n`;
                 });
-            } else { reportContent += `- No failed activities recorded in the last 24 hours.\n`; }
+            } else {
+                reportContent += `- No failed activities recorded in the last 24 hours.\n`;
+            }
+            reportContent += `\n`;
+
+            // --- 新增：24 小时内下载次数最多的前 10 个文件 ---
+            reportContent += `### Top 10 Most Downloaded Files (Last 24 Hours):\n`;
+            const topDownloadedStmt = env.DB.prepare(
+                "SELECT user_id, original_file_path, file_hash, COUNT(*) as download_count " +
+                "FROM FileActivityLogs " +
+                "WHERE logged_at >= ? AND action_type = 'download' AND status = 'success' " +
+                "GROUP BY user_id, original_file_path, file_hash " + // 分组确保唯一文件
+                "ORDER BY download_count DESC LIMIT 10"
+            );
+            const { results: topDownloads, error: tdError } = await topDownloadedStmt.bind(activityTimeLimit).all();
+            if (tdError) throw tdError;
+
+            if (topDownloads && topDownloads.length > 0) {
+                reportContent += `| User ID        | Original File Path (truncated) | File Hash (partial)      | Download Count |\n`;
+                reportContent += `|----------------|--------------------------------|--------------------------|----------------|\n`;
+                for (const dl of topDownloads) {
+                    const pathPreview = dl.original_file_path.length > 30 ? dl.original_file_path.substring(0, 27) + "..." : dl.original_file_path;
+                    const hashPreview = dl.file_hash ? dl.file_hash.substring(0, 12) + "..." : "N/A";
+                    reportContent += `| ${dl.user_id.padEnd(14)} | ${pathPreview.padEnd(30)} | ${hashPreview.padEnd(24)} | ${String(dl.download_count).padEnd(14)} |\n`;
+                }
+            } else {
+                reportContent += `- No files downloaded in the last 24 hours, or no successful download logs.\n`;
+            }
+            reportContent += `\n`;
+            // ---------------------------------------------
+
+
+            // 3. 最近的几条详细日志 (保持不变)
+            reportContent += `### Latest Activity Details (Sample - Max 10):\n`;
+            const latestDetailsStmt = env.DB.prepare(
+                "SELECT logged_at, user_id, action_type, SUBSTR(original_file_path, 1, 40) as path_preview, status, SUBSTR(error_message, 1, 30) as error_preview " +
+                "FROM FileActivityLogs WHERE logged_at >= ? ORDER BY logged_at DESC LIMIT 10"
+            );
+            const { results: latestDetails, error: ldError } = await latestDetailsStmt.bind(activityTimeLimit).all();
+            if (ldError) throw ldError;
+
+            if (latestDetails && latestDetails.length > 0) {
+                reportContent += `| Timestamp (UTC)       | User ID        | Action   | Path Preview (40 chars)      | Status  | Error Preview (30 chars) |\n`;
+                reportContent += `|-----------------------|----------------|----------|------------------------------|---------|--------------------------|\n`;
+                latestDetails.forEach(detail => { /* ... (和之前一样格式化输出) ... */ 
+                    const ts = detail.logged_at.replace('T', ' ').substring(0, 19);
+                    reportContent += `| ${ts.padEnd(21)} | ${detail.user_id.padEnd(14)} | ${detail.action_type.padEnd(8)} | ${(detail.path_preview || '').padEnd(28)} | ${detail.status.padEnd(7)} | ${(detail.error_preview || 'N/A').padEnd(24)} |\n`;
+                });
+            } else {
+                reportContent += `- No detailed activity entries in the last 24 hours.\n`;
+            }
             reportContent += `\n`;
 
         } catch (dbError) {
-            reportContent += `- Error fetching recent activity: ${dbError.message}\n\n`;
-            if (env.LOGGING_ENABLED === "true") console.error("[StatusReportTask] D1 Error fetching activity logs:", dbError);
+            const errorMessage = `Error fetching recent activity from D1: ${dbError.message}`;
+            reportContent += `- ${errorMessage}\n\n`;
+            if (env.LOGGING_ENABLED === "true") console.error("[StatusReportTask] D1 Error fetching activity logs:", dbError.message, dbError.stack);
+            // 考虑是否将此 DB 错误也记录到 GitHub 错误日志
+            // await logErrorToGitHub(env, 'StatusReportDbActivityError', dbError, `Cron: ${event.cron}`);
         }
     } else {
          reportContent += `- Recent activity unavailable (D1 DB not configured).\n\n`;
