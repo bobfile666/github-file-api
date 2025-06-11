@@ -17,7 +17,7 @@ import * as kvService from '../services/kvStore.js';
 // --- 内部辅助函数：索引管理 ---
 async function getUserIndex(env, username, targetBranch) {
     // 功能：获取指定用户的 index.json 内容。
-    // (此函数已在先前讨论中提供并完善，确保其定义是唯一的)
+    // (此函数已在先前回答中提供，包含日志和错误处理，确保 base64ToArrayBuffer 从 crypto.js 导入)
     const owner = env.GITHUB_REPO_OWNER;
     const repo = env.GITHUB_REPO_NAME;
     const indexPath = `${username}/index.json`;
@@ -25,7 +25,6 @@ async function getUserIndex(env, username, targetBranch) {
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[getUserIndex] User: ${username} - Fetching index: ${indexPath} on branch ${targetBranch}`);
     }
-
     const indexFile = await githubService.getFileContentAndSha(env, owner, repo, indexPath, targetBranch);
 
     if (indexFile && indexFile.content_base64) {
@@ -35,7 +34,7 @@ async function getUserIndex(env, username, targetBranch) {
             if (env.LOGGING_ENABLED === "true") {
                 console.log(`[getUserIndex] User: ${username} - Index found. SHA: ${indexFile.sha}. Files count: ${Object.keys(indexData.files || {}).length}`);
             }
-            return { indexData: indexData.files ? indexData : { files: {} }, sha: indexFile.sha };
+            return { indexData: indexData.files ? indexData : { files: {} }, sha: indexFile.sha, error: null };
         } catch (e) {
             if (env.LOGGING_ENABLED === "true") {
                 console.error(`[getUserIndex] User: ${username} - Error parsing index.json:`, e.message, "Content causing error:", indexFile.content_base64 ? indexFile.content_base64.substring(0,100) : "N/A");
@@ -44,18 +43,19 @@ async function getUserIndex(env, username, targetBranch) {
             parseError.status = 500; 
             parseError.isServerError = true; 
             parseError.details = { originalError: e.message, contentPreview: indexFile.content_base64 ? indexFile.content_base64.substring(0,100) : "N/A" };
-            throw parseError;
+            // 返回错误对象而不是抛出，让调用者明确处理
+            return { indexData: { files: {} }, sha: indexFile.sha, error: parseError };
         }
     }
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[getUserIndex] User: ${username} - Index file not found or content empty. Returning new index structure.`);
     }
-    return { indexData: { files: {} }, sha: null };
+    return { indexData: { files: {} }, sha: null, error: null };
 }
 
 async function updateUserIndex(env, username, indexData, currentSha, targetBranch, commitMessage) {
     // 功能：更新或创建用户的 index.json 文件。
-    // (此函数已在先前讨论中提供并完善，确保其定义是唯一的)
+    // (此函数已在先前讨论中提供并完善，确保 arrayBufferToBase64 从 crypto.js 导入)
     const owner = env.GITHUB_REPO_OWNER;
     const repo = env.GITHUB_REPO_NAME;
     const indexPath = `${username}/index.json`;
@@ -70,9 +70,9 @@ async function updateUserIndex(env, username, indexData, currentSha, targetBranc
     const result = await githubService.createFileOrUpdateFile(env, owner, repo, indexPath, targetBranch, contentBase64, commitMessage, currentSha);
     
     const success = result && !result.error && (result.status === 200 || result.status === 201);
-    if (!success) { // 如果 GitHub 操作不成功
+    if (!success) {
         const updateError = new Error(`GitHub: Failed to update user index for ${username}. API status: ${result?.status}, message: ${result?.message}`);
-        updateError.status = result?.status === 409 ? 409 : (result?.status || 500); // 409 conflict (e.g. bad SHA), otherwise 500
+        updateError.status = result?.status === 409 ? 409 : (result?.status || 500);
         updateError.isServerError = updateError.status >= 500 || updateError.status === 409; 
         updateError.details = result;
         if (env.LOGGING_ENABLED === "true") {
@@ -83,123 +83,219 @@ async function updateUserIndex(env, username, indexData, currentSha, targetBranc
     if (env.LOGGING_ENABLED === "true") {
         console.log(`[updateUserIndex] User: ${username} - Index ${currentSha ? 'updated' : 'created'} successfully. New SHA: ${result.content?.sha}`);
     }
-    return result; // 返回 GitHub 成功的响应对象
+    return result; 
 }
 
 
 // --- 导出的请求处理函数 ---
 
 export async function handleFileUpload(request, env, ctx, authenticatedUsername, originalFilePath) {
-    // 功能：处理文件上传，包括唯一原始文件名检查、速率限制、加密、GitHub 存储、索引更新、KV 时间戳更新和日志记录。
+    // 功能：处理文件上传，包括唯一原始文件名检查、速率限制、加密、GitHub 存储、
+    //       物理文件上传后验证、索引更新、KV 时间戳更新和详细日志记录。
     const startTime = Date.now();
-    if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - START - Upload for: ${originalFilePath}`);
+    if (env.LOGGING_ENABLED === "true") {
+        console.log(`[handleFileUpload] User: ${authenticatedUsername} - START - Upload for: ${originalFilePath}`);
+    }
 
     let logEntry = {
-        user_id: authenticatedUsername, action_type: 'upload', original_file_path: originalFilePath,
-        file_hash: null, file_size_bytes: 0, status: 'failure', duration_ms: null,
-        error_message: null, source_ip: request.headers.get('cf-connecting-ip'), user_agent: request.headers.get('user-agent')
+        user_id: authenticatedUsername,
+        action_type: 'upload',
+        original_file_path: originalFilePath,
+        file_hash: null,
+        file_size_bytes: 0,
+        status: 'failure', // 默认为失败，成功时更新
+        duration_ms: null,
+        error_message: null,
+        source_ip: request.headers.get('cf-connecting-ip'),
+        user_agent: request.headers.get('user-agent')
     };
 
     try {
+        // 0. 早期参数有效性检查
         if (!authenticatedUsername || !originalFilePath) {
             logEntry.error_message = "Authenticated username and original file path are required.";
-            const err = new Error(logEntry.error_message); err.status = 400; err.isClientError = true;
+            const err = new Error(logEntry.error_message); 
+            err.status = 400; 
+            err.isClientError = true; // 标记为客户端错误
             throw err;
         }
 
+        // 1. 速率限制检查
         const UPLOAD_INTERVAL_SECONDS = parseInt(env.UPLOAD_INTERVAL_SECONDS || "10", 10);
-        const currentTimeForRateLimit = Date.now();
+        const currentTimeForRateLimit = Date.now(); // 用于速率限制的时间戳
         const lastUploadTimeMs = await kvService.getLastUploadTimestamp(env, authenticatedUsername);
+
         if (lastUploadTimeMs && (currentTimeForRateLimit - lastUploadTimeMs) < (UPLOAD_INTERVAL_SECONDS * 1000)) {
             const waitSeconds = Math.ceil(((UPLOAD_INTERVAL_SECONDS * 1000) - (currentTimeForRateLimit - lastUploadTimeMs)) / 1000);
-            logEntry.error_message = `Rate limited. Wait ${waitSeconds}s.`;
-            logEntry.status = 'failure_rate_limited';
-            const err = new Error(logEntry.error_message); err.status = 429; err.isClientError = true;
+            logEntry.error_message = `Rate limited. Please wait ${waitSeconds} seconds.`;
+            logEntry.status = 'failure_rate_limited'; // 更具体的失败状态
+            const err = new Error(logEntry.error_message); 
+            err.status = 429; 
+            err.isClientError = true;
             throw err;
         }
 
+        // 读取请求体
         const plainContentArrayBuffer = await request.arrayBuffer();
         logEntry.file_size_bytes = plainContentArrayBuffer.byteLength;
+
         if (plainContentArrayBuffer.byteLength === 0) {
             logEntry.error_message = "Cannot upload an empty file.";
             const err = new Error(logEntry.error_message); err.status = 400; err.isClientError = true;
             throw err;
         }
 
+        // 2. 获取用户索引并检查原始文件名是否已存在 (禁止覆盖)
         const indexResult = await getUserIndex(env, authenticatedUsername, env.TARGET_BRANCH || "main");
-        if (indexResult.error) throw indexResult.error;
+        if (indexResult.error) { // 如果 getUserIndex 内部解析失败并返回错误对象
+             const err = indexResult.error; // 这个错误对象应该已经有 status 和 isServerError 标记
+             logEntry.error_message = err.message;
+             throw err; // 直接抛出由 getUserIndex 构造的错误
+        }
         const { indexData, sha: indexSha } = indexResult;
+
         if (indexData && indexData.files && indexData.files[originalFilePath]) {
-            logEntry.error_message = `File with the name '${originalFilePath}' already exists.`;
-            const err = new Error(logEntry.error_message); err.status = 409; err.isClientError = true;
+            logEntry.error_message = `File with the name '${originalFilePath}' already exists for this user. Upload aborted to prevent overwrite.`;
+            const err = new Error(logEntry.error_message); err.status = 409; err.isClientError = true; // 409 Conflict
             throw err;
         }
         
+        // 3. 获取用户文件加密密钥
         const userFileEncryptionKey = await getUserSymmetricKey(env, authenticatedUsername);
         if (!userFileEncryptionKey) {
-            logEntry.error_message = `Encryption key not found for user.`;
-            const err = new Error(logEntry.error_message); err.status = 403; err.isClientError = true;
+            logEntry.error_message = `Encryption key not found for user '${authenticatedUsername}'. Setup might be incomplete.`;
+            const err = new Error(logEntry.error_message); 
+            err.status = 403; // 可能是用户不存在或密钥配置问题
+            err.isClientError = true; // 假设是客户端/配置问题，如果密钥确实找不到
             throw err;
         }
+        
+        // 4. 加密文件内容
         const encryptedData = await encryptDataAesGcm(plainContentArrayBuffer, userFileEncryptionKey);
         const ivAndCiphertextBuffer = new Uint8Array(encryptedData.iv.byteLength + encryptedData.ciphertext.byteLength);
         ivAndCiphertextBuffer.set(encryptedData.iv, 0);
         ivAndCiphertextBuffer.set(new Uint8Array(encryptedData.ciphertext), encryptedData.iv.byteLength);
         const contentToUploadBase64 = arrayBufferToBase64(ivAndCiphertextBuffer.buffer);
         
+        // 5. 计算原始文件内容的哈希, 准备路径
         const fileHash = await calculateSha256(plainContentArrayBuffer);
         logEntry.file_hash = fileHash;
         const hashedFilePath = `${authenticatedUsername}/${fileHash}`; 
-        const owner = env.GITHUB_REPO_OWNER; const repo = env.GITHUB_REPO_NAME; const targetBranch = env.TARGET_BRANCH || "main";
+        const owner = env.GITHUB_REPO_OWNER; 
+        const repo = env.GITHUB_REPO_NAME; 
+        const targetBranch = env.TARGET_BRANCH || "main";
 
+        // 6. 上传物理文件 (哈希文件)
         const fileCommitMessage = `Chore: Upload content ${fileHash} for ${authenticatedUsername} (orig: ${originalFilePath})`;
-        const existingHashedFile = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
-        if (!existingHashedFile) { 
-            const uploadResult = await githubService.createFileOrUpdateFile(env, owner, repo, hashedFilePath, targetBranch, contentToUploadBase64, fileCommitMessage, null);
-            if (uploadResult.error) {
-                logEntry.error_message = `GitHub upload error: ${uploadResult.message}`;
-                const err = new Error(logEntry.error_message); err.status = uploadResult.status || 500; err.isServerError = true; err.details = uploadResult.details;
+        const existingHashedFileMeta = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
+        
+        let physicalFileShaOnGitHub = existingHashedFileMeta?.sha; 
+
+        if (!existingHashedFileMeta || !existingHashedFileMeta.exists) { 
+            if (existingHashedFileMeta && existingHashedFileMeta.error && existingHashedFileMeta.status !== 404) {
+                // 检查物理文件是否存在时发生非404错误
+                logEntry.error_message = `GitHub error checking physical file ${hashedFilePath}: ${existingHashedFileMeta.error}`;
+                const err = new Error(logEntry.error_message); 
+                err.status = existingHashedFileMeta.status || 503; // 使用GitHub返回的状态或503
+                err.isServerError = true; 
+                err.details = existingHashedFileMeta.details;
                 throw err;
+            }
+
+            // 物理文件不存在，创建它
+            if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - Physical hash file ${hashedFilePath} does not exist. Creating...`);
+            const uploadResult = await githubService.createFileOrUpdateFile(env, owner, repo, hashedFilePath, targetBranch, contentToUploadBase64, fileCommitMessage, null);
+            
+            if (uploadResult.error || !uploadResult.content?.sha) {
+                logEntry.error_message = `GitHub physical file upload error: ${uploadResult.message || 'Unknown error during creation or SHA missing from response'}`;
+                const err = new Error(logEntry.error_message); 
+                err.status = uploadResult.status || 500; 
+                err.isServerError = true; 
+                err.details = uploadResult.details || uploadResult;
+                throw err;
+            }
+            physicalFileShaOnGitHub = uploadResult.content.sha;
+            if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - Physical file ${hashedFilePath} created. SHA: ${physicalFileShaOnGitHub}`);
+
+            // ---- 新增：上传后立即验证物理文件是否存在 ----
+            const verificationCheck = await githubService.getFileShaFromPath(env, owner, repo, hashedFilePath, targetBranch);
+            if (!verificationCheck || !verificationCheck.exists || verificationCheck.sha !== physicalFileShaOnGitHub) {
+                logEntry.error_message = `GitHub physical file upload verification failed for ${hashedFilePath}. Expected SHA ${physicalFileShaOnGitHub}, found ${verificationCheck?.sha}.`;
+                const err = new Error(logEntry.error_message);
+                err.status = 500; 
+                err.isServerError = true;
+                err.details = { verificationResult: verificationCheck, expectedSha: physicalFileShaOnGitHub };
+                if (env.LOGGING_ENABLED === "true") console.error(`[handleFileUpload] ${err.message}`, err.details);
+                // 在索引更新前抛出此错误，非常重要
+                throw err;
+            }
+            if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - Physical file ${hashedFilePath} verified on GitHub after upload.`);
+            // -----------------------------------------
+
+        } else {
+            if (env.LOGGING_ENABLED === "true") {
+                console.log(`[handleFileUpload] User: ${authenticatedUsername} - Physical hash file ${hashedFilePath} already exists (SHA: ${physicalFileShaOnGitHub}). Assuming content is identical.`);
             }
         }
         
-        if (!indexData.files) indexData.files = {};
+        // 7. 更新索引
+        // 确保indexData.files存在
+        if (!indexData.files) {
+            indexData.files = {};
+        }
         indexData.files[originalFilePath] = fileHash; 
-        const indexCommitMessage = `Feat: Index update for ${authenticatedUsername}, add '${originalFilePath}'`;
-        await updateUserIndex(env, authenticatedUsername, indexData, indexSha, targetBranch, indexCommitMessage);
+        const indexCommitMessage = `Feat: Index update for ${authenticatedUsername}, add '${originalFilePath}' (hash: ${fileHash})`;
+        // updateUserIndex 内部会在失败时抛出错误，该错误会被顶层catch捕获
+        const updatedIndexResult = await updateUserIndex(env, authenticatedUsername, indexData, indexSha, targetBranch, indexCommitMessage); 
 
+        // ---- 所有步骤成功 ----
         logEntry.status = 'success';
-        const kvTimestampTtl = parseInt(env.KV_TIMESTAMP_TTL_SECONDS || "86400", 10);
+        // 更新KV中的速率限制时间戳 (只有完全成功才更新)
+        const kvTimestampTtl = parseInt(env.KV_TIMESTAMP_TTL_SECONDS || "86400", 10); // 例如24小时TTL
         ctx.waitUntil(kvService.updateLastUploadTimestamp(env, authenticatedUsername, currentTimeForRateLimit, kvTimestampTtl ));
         
         logEntry.duration_ms = Date.now() - startTime;
-        ctx.waitUntil(logFileActivity(env, logEntry));
-        if (env.LOGGING_ENABLED === "true") console.log(`[handleFileUpload] User: ${authenticatedUsername} - END - Success for: ${originalFilePath}. Duration: ${logEntry.duration_ms}ms`);
+        ctx.waitUntil(logFileActivity(env, logEntry)); // 异步记录成功日志
+        if (env.LOGGING_ENABLED === "true") {
+            console.log(`[handleFileUpload] User: ${authenticatedUsername} - END - Success for: ${originalFilePath}. Duration: ${logEntry.duration_ms}ms. Index SHA: ${updatedIndexResult.content?.sha}`);
+        }
         
         return jsonResponse({
-            message: `File '${originalFilePath}' (as '${fileHash}') uploaded successfully for '${authenticatedUsername}'.`,
-            originalPath: originalFilePath, filePathInRepo: hashedFilePath, fileHash: fileHash,
+            message: `File '${originalFilePath}' (as '${fileHash}') uploaded successfully for user '${authenticatedUsername}'.`,
+            username: authenticatedUsername,
+            originalPath: originalFilePath,
+            filePathInRepo: hashedFilePath,
+            fileHash: fileHash,
+            indexPath: `${authenticatedUsername}/index.json`,
+            indexSha: updatedIndexResult.content?.sha // 返回新的索引SHA
         }, 201);
 
     } catch (error) {
-        // 确保即使在早期抛出错误，logEntry.error_message 也被设置
+        // 捕获所有在try块中主动抛出的错误或意外的JS错误
+        // 确保logEntry.error_message有值
         if (!logEntry.error_message && error.message) {
-            logEntry.error_message = error.message.substring(0,255);
+            logEntry.error_message = error.message.substring(0,255); // 截断以防过长
         }
         logEntry.status = logEntry.status === 'failure_rate_limited' ? logEntry.status : 'failure'; // 保留特定的失败状态
+        
         logEntry.duration_ms = Date.now() - startTime;
-        ctx.waitUntil(logFileActivity(env, logEntry));
+        ctx.waitUntil(logFileActivity(env, logEntry)); // 异步记录包含错误的日志
 
         if (env.LOGGING_ENABLED === "true") {
-            console.error(`[handleFileUpload Catch] User: ${authenticatedUsername} - Error for '${originalFilePath}':`, error.message, error.details || error.stack);
+            console.error(`[handleFileUpload Catch] User: ${authenticatedUsername} - Error during upload of '${originalFilePath}':`, 
+                          error.message, 
+                          error.status ? `Status: ${error.status}` : '',
+                          error.details || '', 
+                          error.stack);
         }
         
-        const statusCode = error.status || 500;
-        // 如果是客户端可以处理的错误 (例如我们自己标记的 isClientError 或 4xx 范围且非服务器问题)
+        const statusCode = error.status || 500; // 从错误对象获取状态码，否则默认为500
+        
+        // 如果是客户端可以处理的错误 (例如我们自己标记的 isClientError 或 4xx 范围且非服务器逻辑问题)
         if (error.isClientError || (statusCode >= 400 && statusCode < 500 && !error.isServerError)) {
             return errorResponse(env, error.message || "An error occurred during file upload.", statusCode, null, error.details);
         } else {
-            // 否则，重新抛出给 index.js 的全局错误处理器，由它记录到GitHub
+            // 否则，认为是服务器端问题，需要上报到GitHub错误日志 (通过重新抛出给index.js的全局错误处理器)
             throw error; 
         }
     }
